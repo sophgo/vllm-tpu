@@ -1667,6 +1667,8 @@ class DeviceConfig:
             self.device = torch.device("cpu")
         elif self.device_type in ["tpu"]:
             self.device = None
+        elif self.device_type in ["sophtpu"]:
+            self.device = torch.device(f"tpu:0")
         else:
             # Set device with device type
             self.device = torch.device(self.device_type)

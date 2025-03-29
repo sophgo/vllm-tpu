@@ -1393,6 +1393,8 @@ class LLM:
         outputs: List[Union[RequestOutput, PoolingRequestOutput]] = []
         total_in_toks = 0
         total_out_toks = 0
+        total_in_time = 0
+        total_out_time = 0
         while self.llm_engine.has_unfinished_requests():
             step_outputs = self.llm_engine.step()
             for output in step_outputs:
@@ -1404,17 +1406,21 @@ class LLM:
                             assert output.prompt_token_ids is not None
                             total_in_toks += len(output.prompt_token_ids)
                             in_spd = total_in_toks / pbar.format_dict["elapsed"]
+                            total_in_time += pbar.format_dict["elapsed"]
                             total_out_toks += sum(
                                 len(stp.token_ids) for stp in output.outputs)
                             out_spd = (total_out_toks /
                                        pbar.format_dict["elapsed"])
+                            total_out_time += pbar.format_dict["elapsed"]
                             pbar.postfix = (
                                 f"est. speed input: {in_spd:.2f} toks/s, "
                                 f"output: {out_spd:.2f} toks/s")
                         pbar.update(1)
 
+        #print("Run engine use %f s for %d total_in_tokens and %f s for %d total_out_tokens." % (total_in_time, total_in_toks, total_out_time, total_out_toks))
         if use_tqdm:
             pbar.close()
+
         # Sort the outputs by request ID.
         # This is necessary because some requests may be finished earlier than
         # its previous requests.

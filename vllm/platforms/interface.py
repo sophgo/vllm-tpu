@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch_tpu
 
 from vllm.logger import init_logger
 
@@ -27,6 +28,7 @@ def in_wsl() -> bool:
 
 
 class _Backend(enum.Enum):
+    SOPHTPU_ATTN = enum.auto()
     FLASH_ATTN = enum.auto()
     FLASH_ATTN_VLLM_V1 = enum.auto()
     XFORMERS = enum.auto()
@@ -47,6 +49,7 @@ class PlatformEnum(enum.Enum):
     CUDA = enum.auto()
     ROCM = enum.auto()
     TPU = enum.auto()
+    SOPHTPU = enum.auto()
     HPU = enum.auto()
     XPU = enum.auto()
     CPU = enum.auto()
@@ -119,6 +122,9 @@ class Platform:
 
     def is_tpu(self) -> bool:
         return self._enum == PlatformEnum.TPU
+
+    def is_sophtpu(self) -> bool:
+        return self._enum == PlatformEnum.SOPHTPU
 
     def is_hpu(self) -> bool:
         return self._enum == PlatformEnum.HPU
@@ -224,7 +230,8 @@ class Platform:
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
-            torch.manual_seed(seed)
+            #torch.manual_seed(seed)
+            torch_tpu.tpu.manual_seed_all(seed)
 
     @classmethod
     def pre_register_and_update(cls,

@@ -403,6 +403,12 @@ class SamplingTensors:
         do_top_p_top_k = False
         do_min_p = False
 
+        #import time
+        #import torch_tpu
+        #torch_tpu.tpu.synchronize()
+        #start_time = time.time_ns()
+        #print(f"Sampler time {start_time / 1000**2:.3f}ms")
+ 
         assert sampling_metadata.seq_groups is not None
         for seq_group in sampling_metadata.seq_groups:
             seq_ids = seq_group.seq_ids
@@ -447,6 +453,9 @@ class SamplingTensors:
                 frequency_penalties += [0] * prefill_len
                 repetition_penalties += [1] * prefill_len
 
+            #torch_tpu.tpu.synchronize()
+            #time0 = time.time_ns()
+            #print(f"Sampler time0 {time0 / 1000**2:.3f}ms")
             if seq_group.do_sample:
                 sample_lens = len(seq_group.sample_indices)
                 assert sample_lens >= len(seq_ids)
@@ -457,6 +466,9 @@ class SamplingTensors:
                 presence_penalties += [p] * sample_lens
                 frequency_penalties += [f] * sample_lens
                 repetition_penalties += [r] * sample_lens
+            #torch_tpu.tpu.synchronize()
+            #time1 = time.time_ns()
+            #print(f"Sampler time1 {time1 / 1000**2:.3f}ms")
 
         if do_penalties:
             for seq_group in sampling_metadata.seq_groups:
@@ -477,6 +489,10 @@ class SamplingTensors:
                         prompt_tokens.append(seq_data.prompt_token_ids_array)
                         output_tokens.append(seq_data.output_token_ids_array)
 
+        #torch_tpu.tpu.synchronize()
+        #time2 = time.time_ns()
+        #print(f"Sampler time2 {time2 / 1000**2:.3f}ms")
+ 
         sampling_tensors = SamplingTensors.from_lists(
             temperatures,
             top_ps,
@@ -491,6 +507,11 @@ class SamplingTensors:
             device,
             dtype,
         )
+
+        #torch_tpu.tpu.synchronize()
+        #time3 = time.time_ns()
+        #print(f"Sampler time3 {time3 / 1000**2:.3f}ms")
+
         return (sampling_tensors, do_penalties, do_top_p_top_k, do_min_p)
 
     @classmethod
@@ -515,82 +536,161 @@ class SamplingTensors:
 
         do_penalties = prompt_tokens or output_tokens
 
-        if do_penalties:
-            prompt_t = make_tensor_with_pad(
-                prompt_tokens,
-                vocab_size,
-                device="cpu",
-                dtype=torch.int64,
+        from vllm.platforms import current_platform
+        if current_platform.is_sophtpu:
+            if do_penalties:
+                prompt_t = make_tensor_with_pad(
+                    prompt_tokens,
+                    vocab_size,
+                    device=device,
+                    dtype=torch.int32,
+                    pin_memory=pin_memory,
+                )
+                output_t = make_tensor_with_pad(
+                    output_tokens,
+                    vocab_size,
+                    device=device,
+                    dtype=torch.int,
+                    pin_memory=pin_memory,
+                )
+            else:
+                empty_tensor = torch.empty(0, device=device, dtype=torch.int32)
+                prompt_t = empty_tensor
+                output_t = empty_tensor
+
+            temperatures_t = torch.tensor(
+                temperatures,
+                device=device,
+                dtype=dtype,
                 pin_memory=pin_memory,
             )
-            output_t = make_tensor_with_pad(
-                output_tokens,
-                vocab_size,
-                device="cpu",
-                dtype=torch.int64,
+            top_ps_t = torch.tensor(
+                top_ps,
+                device=device,
+                dtype=dtype,
                 pin_memory=pin_memory,
+            )
+            min_ps_t = torch.tensor(
+                min_ps,
+                device=device,
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
+            presence_penalties_t = torch.tensor(
+                presence_penalties,
+                device=device,
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
+            frequency_penalties_t = torch.tensor(
+                frequency_penalties,
+                device=device,
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
+            repetition_penalties_t = torch.tensor(
+                repetition_penalties,
+                device=device,
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
+            top_ks_t = torch.tensor(
+                top_ks,
+                device=device,
+                dtype=torch.int32,
+                pin_memory=pin_memory,
+            )
+            # Because the memory is pinned, we can do non-blocking
+            # transfer to device.
+
+            return cls(
+                temperatures=temperatures_t,
+                top_ps=top_ps_t,
+                top_ks=top_ks_t,
+                min_ps=min_ps_t,
+                presence_penalties=presence_penalties_t,
+                frequency_penalties=frequency_penalties_t,
+                repetition_penalties=repetition_penalties_t,
+                prompt_tokens=prompt_t,
+                output_tokens=output_t,
             )
         else:
-            empty_tensor = torch.empty(0, device=device, dtype=torch.long)
-            prompt_t = empty_tensor
-            output_t = empty_tensor
+            if do_penalties:
+                prompt_t = make_tensor_with_pad(
+                    prompt_tokens,
+                    vocab_size,
+                    device="cpu",
+                    dtype=torch.int64,
+                    pin_memory=pin_memory,
+                )
+                output_t = make_tensor_with_pad(
+                    output_tokens,
+                    vocab_size,
+                    device="cpu",
+                    dtype=torch.int64,
+                    pin_memory=pin_memory,
+                )
+            else:
+                empty_tensor = torch.empty(0, device=device, dtype=torch.long)
+                prompt_t = empty_tensor
+                output_t = empty_tensor
 
-        temperatures_t = torch.tensor(
-            temperatures,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        top_ps_t = torch.tensor(
-            top_ps,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        min_ps_t = torch.tensor(
-            min_ps,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        presence_penalties_t = torch.tensor(
-            presence_penalties,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        frequency_penalties_t = torch.tensor(
-            frequency_penalties,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        repetition_penalties_t = torch.tensor(
-            repetition_penalties,
-            device="cpu",
-            dtype=dtype,
-            pin_memory=pin_memory,
-        )
-        top_ks_t = torch.tensor(
-            top_ks,
-            device="cpu",
-            dtype=torch.int,
-            pin_memory=pin_memory,
-        )
-        # Because the memory is pinned, we can do non-blocking
-        # transfer to device.
+            temperatures_t = torch.tensor(
+                temperatures,
+                device="cpu",
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
+            top_ps_t = torch.tensor(
+                top_ps,
+                device="cpu",
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
+            min_ps_t = torch.tensor(
+                min_ps,
+                device="cpu",
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
+            presence_penalties_t = torch.tensor(
+                presence_penalties,
+                device="cpu",
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
+            frequency_penalties_t = torch.tensor(
+                frequency_penalties,
+                device="cpu",
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
+            repetition_penalties_t = torch.tensor(
+                repetition_penalties,
+                device="cpu",
+                dtype=dtype,
+                pin_memory=pin_memory,
+            )
+            top_ks_t = torch.tensor(
+                top_ks,
+                device="cpu",
+                dtype=torch.int,
+                pin_memory=pin_memory,
+            )
+            # Because the memory is pinned, we can do non-blocking
+            # transfer to device.
 
-        return cls(
-            temperatures=temperatures_t.to(device=device, non_blocking=True),
-            top_ps=top_ps_t.to(device=device, non_blocking=True),
-            top_ks=top_ks_t.to(device=device, non_blocking=True),
-            min_ps=min_ps_t.to(device=device, non_blocking=True),
-            presence_penalties=presence_penalties_t.to(device=device,
-                                                       non_blocking=True),
-            frequency_penalties=frequency_penalties_t.to(device=device,
-                                                         non_blocking=True),
-            repetition_penalties=repetition_penalties_t.to(device=device,
+            return cls(
+                temperatures=temperatures_t.to(device=device, non_blocking=True),
+                top_ps=top_ps_t.to(device=device, non_blocking=True),
+                top_ks=top_ks_t.to(device=device, non_blocking=True),
+                min_ps=min_ps_t.to(device=device, non_blocking=True),
+                presence_penalties=presence_penalties_t.to(device=device,
                                                            non_blocking=True),
-            prompt_tokens=prompt_t.to(device=device, non_blocking=True),
-            output_tokens=output_t.to(device=device, non_blocking=True),
-        )
+                frequency_penalties=frequency_penalties_t.to(device=device,
+                                                             non_blocking=True),
+                repetition_penalties=repetition_penalties_t.to(device=device,
+                                                               non_blocking=True),
+                prompt_tokens=prompt_t.to(device=device, non_blocking=True),
+                output_tokens=output_t.to(device=device, non_blocking=True),
+            )

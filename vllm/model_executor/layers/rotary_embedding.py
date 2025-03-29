@@ -121,6 +121,19 @@ class RotaryEmbedding(CustomOp):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
+    def get_cos_sin(
+        self,
+        positions: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """A PyTorch-native implementation of forward()."""
+        if offsets is not None:
+            positions = positions + offsets
+        positions = positions.flatten()
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        return cos, sin
+
     def forward_native(
         self,
         positions: torch.Tensor,
@@ -150,6 +163,36 @@ class RotaryEmbedding(CustomOp):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+
+    def forward_sophtpu(
+        self,
+        positions: torch.Tensor,
+        #query: torch.Tensor,
+        #key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """A PyTorch-native implementation of forward()."""
+        if offsets is not None:
+            positions = positions + offsets
+        positions = positions.flatten()
+        num_tokens = positions.shape[0]
+        cos_sin = self.cos_sin_cache.index_select(0, positions)
+        cos, sin = cos_sin.chunk(2, dim=-1)
+
+        #query_shape = query.shape
+        #query = query.view(num_tokens, -1, self.head_size)
+        #query_rot = query[..., :self.rotary_dim]
+        #query_pass = query[..., self.rotary_dim:]
+        #query_rot = _apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        #query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
+
+        #key_shape = key.shape
+        #key = key.view(num_tokens, -1, self.head_size)
+        #key_rot = key[..., :self.rotary_dim]
+        #key_pass = key[..., self.rotary_dim:]
+        #key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        #key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
+        return cos, sin
 
     def forward_cuda(
         self,

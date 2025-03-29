@@ -29,6 +29,15 @@ def vllm_version_matches_substr(substr: str) -> bool:
         raise e
     return substr in vllm_version
 
+def sophtpu_platform_plugin() -> Optional[str]:
+    is_sophtpu = False
+    try:
+        import torch_tpu  # noqa: F401
+        is_sophtpu = True
+    except Exception:
+        pass
+
+    return "vllm.platforms.sophtpu.SophTpuPlatform" if is_sophtpu else None
 
 def tpu_platform_plugin() -> Optional[str]:
     is_tpu = False
@@ -158,6 +167,7 @@ def openvino_platform_plugin() -> Optional[str]:
 
 
 builtin_platform_plugins = {
+    'sophtpu': sophtpu_platform_plugin,
     'tpu': tpu_platform_plugin,
     'cuda': cuda_platform_plugin,
     'rocm': rocm_platform_plugin,
@@ -215,6 +225,7 @@ def resolve_current_platform_cls_qualname() -> str:
 
 _current_platform = None
 _init_trace: str = ''
+
 
 if TYPE_CHECKING:
     current_platform: Platform

@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.custom_op import CustomOp
-
+from vllm.platforms import current_platform
 
 @CustomOp.register("rms_norm")
 class RMSNorm(CustomOp):
@@ -31,7 +31,10 @@ class RMSNorm(CustomOp):
                                        else var_hidden_size)
         self.has_weight = has_weight
 
-        self.weight = torch.ones(hidden_size)
+        if current_platform.is_sophtpu:
+            self.weight = torch.ones(hidden_size, dtype = torch.half)
+        else:
+            self.weight = torch.ones(hidden_size)
         if self.has_weight:
             self.weight = nn.Parameter(self.weight)
 
@@ -142,6 +145,13 @@ class RMSNorm(CustomOp):
             self.weight.data,
             self.variance_epsilon,
         )
+
+    def forward_sophtpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        pass
 
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"

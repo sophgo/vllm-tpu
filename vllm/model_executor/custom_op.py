@@ -54,6 +54,9 @@ class CustomOp(nn.Module):
         # NOTE(woosuk): This is a placeholder for future extensions.
         return self.forward_native(*args, **kwargs)
 
+    def forward_sophtpu(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
     def forward_hpu(self, *args, **kwargs):
         # By default, we assume that Gaudi ops are compatible with the
         # PyTorch-native implementation.
@@ -86,6 +89,8 @@ class CustomOp(nn.Module):
             return self.forward_hpu
         elif current_platform.is_tpu():
             return self.forward_tpu
+        elif current_platform.is_sophtpu():
+            return self.forward_sophtpu
         elif current_platform.is_xpu():
             return self.forward_xpu
         elif current_platform.is_out_of_tree():

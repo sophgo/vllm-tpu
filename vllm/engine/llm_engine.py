@@ -1310,6 +1310,8 @@ class LLMEngine:
             >>>     if not (engine.has_unfinished_requests() or example_inputs):
             >>>         break
         """
+        #import time
+        #start_time = time.time_ns()
         if self.parallel_config.pipeline_parallel_size > 1:
             raise NotImplementedError(
                 "Pipeline parallelism is only supported through AsyncLLMEngine "
@@ -1390,6 +1392,9 @@ class LLMEngine:
 
             outputs = self.model_executor.execute_model(
                 execute_model_req=execute_model_req)
+            #import time
+            #end_time = time.time_ns()
+            #print(f"End get time {end_time / 1000**2:.3f}ms")
 
             # We need to do this here so that last step's sampled_token_ids can
             # be passed to the next iteration for PP.
@@ -1461,6 +1466,10 @@ class LLMEngine:
             # queued control plane messages, such as add/remove lora adapters.
             logger.debug("Stopping remote worker execution loop.")
             self.model_executor.stop_remote_worker_execution_loop()
+
+        #end3_time = time.time_ns()
+        #time3 = end3_time - end2_time
+        #print(f"Forward time3 use {time3 / 1000**2:.3f}ms")
 
         return ctx.request_outputs
 
