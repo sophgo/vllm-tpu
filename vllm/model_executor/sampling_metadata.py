@@ -11,6 +11,7 @@ from vllm.sequence import (VLLM_TOKEN_ID_ARRAY_TYPE, SequenceData,
                            SequenceGroupMetadata)
 from vllm.utils import (PyObjectCache, async_tensor_h2d,
                         is_pin_memory_available, make_tensor_with_pad)
+from vllm.platforms import current_platform
 
 _SAMPLING_EPS = 1e-5
 
@@ -161,22 +162,40 @@ class SamplingMetadata:
             num_prompts,
         ) = _prepare_seq_groups(seq_group_metadata_list, seq_lens, query_lens,
                                 device, generators, cache)
-        selected_token_indices = async_tensor_h2d(
-            selected_token_indices,
-            dtype=torch.long,
-            target_device=device,
-            pin_memory=pin_memory,
-        )
-        categorized_sample_indices = {
-            t:
-            async_tensor_h2d(
-                seq_ids,
-                dtype=torch.int,
+        if current_platform.is_sophtpu:
+            selected_token_indices = torch.tensor(
+                selected_token_indices,
+                dtype=torch.long,
+                pin_memory=pin_memory, 
+                device=device
+                )
+            categorized_sample_indices = {
+                t:
+                torch.tensor(
+                    seq_ids, 
+                    dtype=torch.int, 
+                    pin_memory=pin_memory, 
+                    device=device
+                    )
+                for t, seq_ids in categorized_sample_indices.items()
+            }
+        else:
+            selected_token_indices = async_tensor_h2d(
+                selected_token_indices,
+                dtype=torch.long,
                 target_device=device,
                 pin_memory=pin_memory,
             )
-            for t, seq_ids in categorized_sample_indices.items()
-        }
+            categorized_sample_indices = {
+                t:
+                async_tensor_h2d(
+                    seq_ids,
+                    dtype=torch.int,
+                    target_device=device,
+                    pin_memory=pin_memory,
+                )
+                for t, seq_ids in categorized_sample_indices.items()
+            }
 
         sampling_metadata = SamplingMetadata(
             seq_groups=seq_groups,

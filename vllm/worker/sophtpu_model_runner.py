@@ -36,6 +36,8 @@ from vllm.worker.model_runner_base import (
 if TYPE_CHECKING:
     from vllm.attention.backends.abstract import AttentionBackend
 
+from vllm.platforms import current_platform
+
 logger = init_logger(__name__)
 
 _PAD_SLOT_ID = -1
@@ -262,14 +264,13 @@ class ModelInputForSophTPUBuilder(ModelRunnerInputBuilderBase[ModelInputForSophT
             max_blocks = max(max_blocks, len(request_blocks))
 
         block_tables_tensor = torch.zeros(
-            (len(block_tables), max_blocks), dtype=torch.int32, device="cpu"
+            (len(block_tables), max_blocks), dtype=torch.int32, device=self.device
         )
         for i, request_blocks in enumerate(block_tables):
             block_tables_tensor[i, :len(request_blocks)] = torch.tensor(request_blocks)
-        if self.device.type == 'sophtpu':
+        if current_platform.is_sophtpu:
             block_tables_tensor *= self.block_size
-        block_tables_tensor = block_tables_tensor.to(self.device)
-
+        # block_tables_tensor = block_tables_tensor.to(self.device)
         num_prompt_tokens = len(input_tokens)
 
         input_tokens = torch.tensor(input_tokens,
@@ -278,9 +279,9 @@ class ModelInputForSophTPUBuilder(ModelRunnerInputBuilderBase[ModelInputForSophT
         input_positions = torch.tensor(input_positions,
                                        dtype=torch.int32,
                                        device=self.device)  # type: ignore
-        slot_mapping = torch.tensor(slot_mapping,
-                                    dtype=torch.int32,
-                                    device=self.device)  # type: ignore
+        # slot_mapping = torch.tensor(slot_mapping,
+        #                             dtype=torch.int32,
+        #                             device=self.device)  # type: ignore
         prompt_lens = torch.tensor(prompt_lens,
                                    dtype=torch.int32,
                                    device="cpu")
@@ -292,7 +293,7 @@ class ModelInputForSophTPUBuilder(ModelRunnerInputBuilderBase[ModelInputForSophT
         }
 
         attn_metadata = self.attn_backend.make_metadata(
-            slot_mapping=slot_mapping,
+            slot_mapping=None,
             multi_modal_placeholder_index_maps=placeholder_index_maps,
             enable_kv_scales_calculation=False,
             effective_query_lens=prompt_lens,
@@ -330,7 +331,7 @@ class ModelInputForSophTPUBuilder(ModelRunnerInputBuilderBase[ModelInputForSophT
                 seq_len = seq_data.get_len()
                 position = seq_len - 1
                 input_positions.append(position)
-
+                
                 seq_len = seq_len if self.sliding_window is None else min(
                     seq_len, self.sliding_window) 
                 context_lens.append(seq_len)
@@ -347,34 +348,29 @@ class ModelInputForSophTPUBuilder(ModelRunnerInputBuilderBase[ModelInputForSophT
                 block_number = block_table[position // self.block_size]
                 block_offset = position % self.block_size
                 slot = block_number * self.block_size + block_offset
-                slot_mapping.append(slot)
+                slot_mapping.append([slot])
 
-        batch_size = _get_padded_batch_size(batch_idx)
-        num_paddings = batch_size - batch_idx
-        input_tokens = input_tokens + [0] * num_paddings
-        input_positions = input_positions + [0] * num_paddings
-        slot_mapping = slot_mapping + [_PAD_SLOT_ID] * num_paddings
-        context_lens = context_lens + [0] * num_paddings
-
-        input_tokens = torch.tensor(input_tokens,
-                                    dtype=torch.int32,
+        input_tokens = torch.tensor(input_tokens, 
+                                    dtype=torch.int32, 
                                     device=self.device)
-        input_positions = torch.tensor(input_positions,
-                                       dtype=torch.int32,
+        input_positions = torch.tensor(input_positions, 
+                                       dtype=torch.int32, 
                                        device=self.device)
-        slot_mapping = torch.tensor(slot_mapping,
-                                    dtype=torch.int32,
+        slot_mapping = torch.tensor(slot_mapping, 
+                                    dtype=torch.int32, 
                                     device=self.device)
-        context_lens = torch.tensor(context_lens,
-                                    dtype=torch.int32,
+        context_lens = torch.tensor(context_lens, 
+                                    dtype=torch.int32, 
                                     device="cpu")
-        block_tables = torch.tensor(self.block_tables[:batch_size],
-                                    dtype=torch.int32,
+        block_tables = torch.tensor(self.block_tables[:batch_idx, :],
+                                    dtype=torch.int32, 
                                     device=self.device)
+        if current_platform.is_sophtpu:
+            block_tables *= self.block_size
         attn_metadata = self.attn_backend.make_metadata(
             num_prefills=0,
             num_prefill_tokens=0,
-            num_decode_tokens=batch_size,
+            num_decode_tokens=batch_idx,
             slot_mapping=slot_mapping,
             multi_modal_placeholder_index_maps=None,
             enable_kv_scales_calculation=False,

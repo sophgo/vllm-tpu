@@ -32,7 +32,7 @@ class RMSNorm(CustomOp):
         self.has_weight = has_weight
 
         if current_platform.is_sophtpu:
-            self.weight = torch.ones(hidden_size, dtype = torch.half)
+            self.weight = torch.empty(hidden_size, dtype = torch.bfloat16)
         else:
             self.weight = torch.ones(hidden_size)
         if self.has_weight:
