@@ -19,6 +19,7 @@ from vllm.model_executor.parameter import (ChannelQuantScaleParameter,
                                            PackedColumnParameter,
                                            PackedvLLMParameter,
                                            RowvLLMParameter)
+from vllm.platforms import current_platform
 
 
 class GPTQConfig(QuantizationConfig):
@@ -110,7 +111,10 @@ class GPTQConfig(QuantizationConfig):
 
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> Optional["GPTQLinearMethod"]:
-        return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
+        if current_platform.is_sophtpu():
+            return get_linear_quant_method(self, layer, prefix, SophGPTQLinearMethod)
+        else:
+            return get_linear_quant_method(self, layer, prefix, GPTQLinearMethod)
 
 
 class ExllamaState(Enum):
@@ -274,3 +278,185 @@ class GPTQLinearMethod(LinearMethodBase):
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)
+
+class SophGPTQLinearMethod(GPTQLinearMethod):
+    """Linear method for GPTQ on SophTPU.
+
+    Inherits from `GPTQLinearMethod` with the following customizations:
+    1. Overrides `create_weights` - Adapts to reordered weights and parameters
+    2. Overrides `process_weights_after_loading` - Implements post-load weight processing
+    3. Overrides `apply` - Integrates SophTPU's GPTQ operator via `torch.ops.my_ops.matmul_gptq_forward`
+
+    Args:
+        quant_config: The GPTQ quantization config.
+    """
+
+    def __init__(self, quant_config: GPTQConfig):
+        super().__init__(quant_config)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        del output_size  # Unused.
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        if input_size_per_partition % self.quant_config.group_size != 0:
+            raise ValueError(
+                "The input size is not aligned with the quantized "
+                "weight shape. This can be caused by too large "
+                "tensor parallel size.")
+        output_size_per_partition = sum(output_partition_sizes)
+        if (output_size_per_partition % self.quant_config.pack_factor.numerator
+                != 0):
+            raise ValueError(
+                "The output size is not aligned with the quantized "
+                "weight shape. This can be caused by too large "
+                "tensor parallel size.")
+
+        if self.quant_config.group_size != -1:
+            group_size = self.quant_config.group_size
+        else:
+            group_size = input_size
+        exllama_state = ExllamaState.UNINITIALIZED
+        scale_and_zero_size = input_size // group_size
+        scale_and_zero_input_dim = None
+        if (input_size != input_size_per_partition
+                and self.quant_config.group_size != -1):
+            # For act-order models, we cannot use Exllama for row parallel layer
+            if self.quant_config.desc_act:
+                exllama_state = ExllamaState.UNUSED
+            else:
+                # we need to partition qzeros and scales for exllama kernel
+                scale_and_zero_size = input_size_per_partition // group_size
+                scale_and_zero_input_dim = 0
+        """
+        Adaptations cover three aspects:
+        1. Shape
+        2. Dtype 
+        3. output_dim and packed_dim_qw
+
+        The shape transformation logic follows the implementation in `weight_reorder()` method.
+
+        Note: `g_idx` and `bias` remain unchanged during reordering.
+        """
+        pack_factor_int32 = self.quant_config.pack_factor.numerator # pack_factor_int32 = 8
+        pack_factor_uint8 = torch.iinfo(torch.uint8).bits // 4 # 2
+        pack_factor = pack_factor_uint8 if current_platform.is_sophtpu() else pack_factor_int32
+        adjusted_input_size = input_size_per_partition // pack_factor
+        adjusted_output_size = output_size_per_partition // pack_factor
+
+        layer_class_name = layer.__class__.__name__
+        is_attention = "SophQKVParallelLinear" in layer_class_name or "SophRowParallelLinear" in layer_class_name 
+        is_mlp_gate_up = "ColumnParallelLinear" in layer_class_name 
+        is_mlp_down = "RowParallelLinear" in layer_class_name
+
+        if is_attention:
+            qweight_shape = (output_size_per_partition, adjusted_input_size)
+            qzeros_shape = (adjusted_output_size*2, # The compression ratio is reduced to pack_factor_uint8 with separated high/low 4-bit extended storage.
+                            scale_and_zero_size//2  # After transposition, every 4 bits in the column direction are packed into 8 bits.
+                            )
+            scales_shape = (output_size_per_partition, scale_and_zero_size * int(16 // 8))
+            scale_dtype = torch.uint8               
+        elif is_mlp_down:
+            effective_group_size = group_size // (torch.iinfo(torch.int32).bits // 8) # 128/(32/8) = 32
+            qweight_shape = (adjusted_input_size // group_size, output_size_per_partition * group_size)
+            qzeros_shape = (scale_and_zero_size // pack_factor, output_size_per_partition)
+            scales_shape = (scale_and_zero_size, output_size_per_partition)
+            scale_dtype = params_dtype
+        elif is_mlp_gate_up:
+            qweight_shape = (output_size_per_partition, adjusted_input_size)
+            qzeros_shape = (output_size_per_partition, scale_and_zero_size // pack_factor)
+            scales_shape = (output_size_per_partition, scale_and_zero_size)
+            scale_dtype = params_dtype
+
+        qweight = PackedvLLMParameter(
+            data=torch.empty(
+                qweight_shape, 
+                dtype=torch.uint8
+            ),
+            input_dim=0,
+            output_dim=0,
+            packed_dim=1,
+            packed_factor=self.quant_config.pack_factor,
+            weight_loader=weight_loader)
+
+        g_idx = RowvLLMParameter(data=torch.tensor(
+            [
+                i // self.quant_config.group_size
+                for i in range(input_size_per_partition)
+            ],
+            dtype=torch.int32,
+        ),
+                                 input_dim=0,
+                                 weight_loader=weight_loader)
+        qzeros_args = {
+            "data":
+            torch.empty(
+                qzeros_shape, 
+                dtype=torch.uint8
+            ),
+            "weight_loader":
+            weight_loader
+        }
+        weight_scale_args = {
+            "data":
+            torch.empty(
+                scales_shape, 
+                dtype=scale_dtype
+            ),
+            "weight_loader":
+            weight_loader
+        }
+        if scale_and_zero_input_dim is None:
+            scales = ChannelQuantScaleParameter(output_dim=0,
+                                                **weight_scale_args)
+            qzeros = PackedColumnParameter(
+                output_dim=0,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                **qzeros_args)
+
+        else:
+            scales = GroupQuantScaleParameter(output_dim=0,
+                                              input_dim=0,
+                                              **weight_scale_args)
+            qzeros = PackedvLLMParameter(
+                input_dim=0,
+                output_dim=0,
+                packed_dim=1,
+                packed_factor=self.quant_config.pack_factor,
+                **qzeros_args)
+
+        layer.register_parameter("qweight", qweight)
+        layer.register_parameter("g_idx", g_idx)
+        layer.register_parameter("qzeros", qzeros)
+        layer.register_parameter("scales", scales)
+
+        layer.exllama_state = exllama_state
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if type(layer).__name__ in ['SophQKVParallelLinear', 'SophRowParallelLinear']:
+            layer.scales.data = torch.cat((layer.scales.data, layer.qzeros.data),dim=-1).contiguous()
+
+    def apply(self,
+              layer: torch.nn.Module,
+              x: torch.Tensor,
+              output_gptq: torch.Tensor,
+              bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+        torch.ops.my_ops.matmul_gptq_forward(
+            x,
+            layer.qweight.data,
+            bias,
+            layer.scales,
+            layer.scales,
+            self.quant_config.group_size,
+            self.quant_config.weight_bits,
+            output_gptq,
+        )
+        return output_gptq   

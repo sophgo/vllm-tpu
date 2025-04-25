@@ -25,7 +25,7 @@ with contextlib.suppress(ImportError):
     import vllm._moe_C  # noqa: F401
     supports_moe_ops = True
 
-if TYPE_CHECKING:
+if TYPE_CHECKING or current_platform.is_sophtpu():
 
     def register_fake(fn):
         return lambda name: fn

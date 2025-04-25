@@ -56,8 +56,9 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.transformers_utils.s3_utils import glob as s3_glob
 from vllm.transformers_utils.utils import is_s3
+from vllm.transformers_utils.config import get_config
 from vllm.utils import is_pin_memory_available
-
+from vllm.model_executor.model_loader.sophtpu_utils import weight_reorder
 
 @contextmanager
 def device_loading_context(module: torch.nn.Module,
@@ -297,6 +298,16 @@ class DefaultModelLoader(BaseModelLoader):
             )
         else:
             hf_folder = model_name_or_path
+
+        if current_platform.is_sophtpu():
+            hf_config = get_config(hf_folder, trust_remote_code = True) # Load the ​**config.json** file from a Hugging Face model directory
+            quantization_config = getattr(hf_config, "quantization_config", None)
+            if hf_config.torch_dtype in (torch.float16, torch.float32):
+                hf_config.torch_dtype = torch.bfloat16
+            if quantization_config:
+                reorder_id = weight_reorder(hf_folder, quantization_config.get('quant_method', None), hf_config.torch_dtype, quantization_config.get('group_size', None))
+                if reorder_id:
+                    hf_folder = reorder_id
 
         hf_weights_files: List[str] = []
         for pattern in allow_patterns:

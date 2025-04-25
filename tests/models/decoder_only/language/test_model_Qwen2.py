@@ -12,9 +12,10 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 MAX_MODEL_LEN = 128
 
-MODELS = ["/workspace/data/data/Qwen2-7B"]
+# MODELS = ["/workspace/data/data/Qwen2-7B"]
 # MODELS = ["/datas/Qwen2-7B"]
 # MODELS = ["/workspace/data/data/Qwen2.5-32B-Instruct"]
+MODELS = ["/workspace/data/data/Qwen2-7B-Instruct-GPTQ-Int4"]
 
 
 def load_example_prompts(file_path: str):
@@ -30,6 +31,7 @@ def test_models(example_prompts, model_name) -> None:
         max_model_len=MAX_MODEL_LEN,
         #trust_remote_code=False,
         enforce_eager=True,
+        quantization="gptq"
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -44,14 +46,14 @@ def test_models(example_prompts, model_name) -> None:
     ]
     params = SamplingParams(max_tokens=128, temperature=0)
 
-    for it in range(2):
-        if it > 0:
-            time.sleep(2)
-        outputs = model.generate(formatted_prompts, params)
-    del model
-
-    # outputs = model.generate(formatted_prompts, params)
+    # for it in range(2):
+    #     if it > 0:
+    #         time.sleep(2)
+    #     outputs = model.generate(formatted_prompts, params)
     # del model
+
+    outputs = model.generate(formatted_prompts, params)
+    del model
 
     # print(model_name, outputs)
     for i in range(len(example_prompts)):
@@ -69,8 +71,8 @@ if __name__ == "__main__":
  
     example_prompts = [
         "What is Deep Learning?",
-        # "What is TPU?",
-        # "How does climate change impact species migration patterns and food web stability in Arctic ecosystems?",
+        "What is TPU?",
+        "How does climate change impact species migration patterns and food web stability in Arctic ecosystems?",
     ]
 
     # Run the tests

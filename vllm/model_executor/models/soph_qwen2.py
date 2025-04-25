@@ -38,7 +38,9 @@ from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                QKVParallelLinear,
-                                               RowParallelLinear)
+                                               RowParallelLinear,
+                                               SophQKVParallelLinear,
+                                               SophRowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.pooler import Pooler, PoolingType
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -87,6 +89,7 @@ class Qwen2MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.quant_config = quant_config
         self.gate_proj = ColumnParallelLinear(
             hidden_size,
             intermediate_size,
@@ -108,10 +111,27 @@ class Qwen2MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
         )
-        self.down_proj_weight = self.down_proj.weight.transpose(0, 1).contiguous()
+        if quant_config:
+            self.bits = quant_config.weight_bits
+            self.groupsize = quant_config.group_size
+            #decode
+            self.up_qweight, self.up_qzeros, self.up_scales = self.up_proj.qweight.data, self.up_proj.qzeros.data, self.up_proj.scales.data
+            self.gate_qweight, self.gate_qzeros, self.gate_scales = self.gate_proj.qweight.data, self.gate_proj.qzeros.data, self.gate_proj.scales.data
+            self.down_qweight, self.down_qzeros, self.down_scales = self.down_proj.qweight.data, self.down_proj.qzeros.data, self.down_proj.scales.data
+        else:
+            self.down_proj_weight = self.down_proj.weight.transpose(0, 1).contiguous()
 
     def forward(self, x, output):
-        torch.ops.my_ops.llama_mlp_forward(x, self.up_proj.weight, self.gate_proj.weight, self.down_proj_weight, None, None, None, output, False)
+        if self.quant_config:
+            torch.ops.my_ops.llama_mlp_gptq_forward(x,
+                                                    self.up_qweight, self.up_qzeros, self.up_scales,
+                                                    self.gate_qweight, self.gate_qzeros, self.gate_scales,
+                                                    self.down_qweight, self.down_qzeros, self.down_scales,
+                                                    self.groupsize,
+                                                    self.bits,
+                                                    output)
+        else:
+            torch.ops.my_ops.llama_mlp_forward(x, self.up_proj.weight, self.gate_proj.weight, self.down_proj_weight, None, None, None, output, False)
         return x
 
 class Qwen2Attention(nn.Module):
@@ -149,7 +169,7 @@ class Qwen2Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.rope_theta = rope_theta
 
-        self.qkv_proj = QKVParallelLinear(
+        self.qkv_proj = SophQKVParallelLinear(
             hidden_size,
             self.head_dim,
             self.total_num_heads,
@@ -158,7 +178,7 @@ class Qwen2Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = SophRowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
@@ -194,7 +214,7 @@ class Qwen2Attention(nn.Module):
         attn_metadata: AttentionMetadata,
         attention_output: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states, attention_output[0])
         query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         #q, k = self.rotary_emb(positions, q, k)
@@ -231,7 +251,7 @@ class Qwen2Attention(nn.Module):
                                     attn_metadata.block_tables.size(1), max_s, block_size, self.scaling, 3)
 
         # Reshape the output tensor.
-        output, _ = self.o_proj(attention_output[1].view(-1, self.num_heads * self.head_dim))
+        output, _ = self.o_proj(attention_output[1].view(-1, self.num_heads * self.head_dim), attention_output[2])
 
         return output
 
@@ -611,8 +631,8 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        kv_caches: List[torch.Tensor],
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
@@ -651,7 +671,6 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                            if self.config.tie_word_embeddings else None),
         )
         return loader.load_weights(weights)
-
 
 class Qwen2EmbeddingModel(nn.Module, SupportsLoRA, SupportsPP):
     packed_modules_mapping = {

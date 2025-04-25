@@ -21,6 +21,7 @@ from vllm.sequence import (VLLM_INVALID_TOKEN_ID,
                            CompletionSequenceGroupOutput, Logprob,
                            PromptLogprobs, SampleLogprobs, SequenceOutput)
 from vllm.spec_decode.metrics import SpecDecodeWorkerMetrics
+from vllm.platforms import current_platform
 
 if envs.VLLM_USE_FLASHINFER_SAMPLER and find_spec("flashinfer"):
     import flashinfer.sampling
@@ -709,7 +710,7 @@ def _sample_with_torch(
         seq_group_id = categorized_seq_group_ids[sampling_type]
         seq_groups = [sampling_metadata.seq_groups[i] for i in seq_group_id]
         sample_metadata[sampling_type] = (seq_group_id, seq_groups)
-        long_sample_indices = sample_indices.long()
+        long_sample_indices = sample_indices.int() if current_platform.is_sophtpu() else sample_indices.long()
         if sampling_type == SamplingType.GREEDY:
             greedy_samples = torch.argmax(logprobs[long_sample_indices],
                                           dim=-1)
