@@ -422,12 +422,6 @@ class SamplingTensors:
         do_top_p_top_k = False
         do_min_p = False
 
-        #import time
-        #import torch_tpu
-        #torch_tpu.tpu.synchronize()
-        #start_time = time.time_ns()
-        #print(f"Sampler time {start_time / 1000**2:.3f}ms")
- 
         assert sampling_metadata.seq_groups is not None
         for seq_group in sampling_metadata.seq_groups:
             seq_ids = seq_group.seq_ids
@@ -472,9 +466,6 @@ class SamplingTensors:
                 frequency_penalties += [0] * prefill_len
                 repetition_penalties += [1] * prefill_len
 
-            #torch_tpu.tpu.synchronize()
-            #time0 = time.time_ns()
-            #print(f"Sampler time0 {time0 / 1000**2:.3f}ms")
             if seq_group.do_sample:
                 sample_lens = len(seq_group.sample_indices)
                 assert sample_lens >= len(seq_ids)
@@ -485,9 +476,6 @@ class SamplingTensors:
                 presence_penalties += [p] * sample_lens
                 frequency_penalties += [f] * sample_lens
                 repetition_penalties += [r] * sample_lens
-            #torch_tpu.tpu.synchronize()
-            #time1 = time.time_ns()
-            #print(f"Sampler time1 {time1 / 1000**2:.3f}ms")
 
         if do_penalties:
             for seq_group in sampling_metadata.seq_groups:
@@ -508,10 +496,6 @@ class SamplingTensors:
                         prompt_tokens.append(seq_data.prompt_token_ids_array)
                         output_tokens.append(seq_data.output_token_ids_array)
 
-        #torch_tpu.tpu.synchronize()
-        #time2 = time.time_ns()
-        #print(f"Sampler time2 {time2 / 1000**2:.3f}ms")
- 
         sampling_tensors = SamplingTensors.from_lists(
             temperatures,
             top_ps,
@@ -526,10 +510,6 @@ class SamplingTensors:
             device,
             dtype,
         )
-
-        #torch_tpu.tpu.synchronize()
-        #time3 = time.time_ns()
-        #print(f"Sampler time3 {time3 / 1000**2:.3f}ms")
 
         return (sampling_tensors, do_penalties, do_top_p_top_k, do_min_p)
 

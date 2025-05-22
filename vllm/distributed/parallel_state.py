@@ -45,6 +45,7 @@ from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 from vllm.utils import (direct_register_custom_op, resolve_obj_by_qualname,
                         supports_custom_op)
+from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -175,8 +176,16 @@ class GroupCoordinator:
         self.cpu_group = None
 
         for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend)
+            from vllm.platforms import current_platform
+            if current_platform.is_sophtpu():
+                import torch_tpu
+                # device_group = torch.distributed.group.WORLD
+                options = torch_tpu.ProcessGroupSCCLOptions()
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend,pg_options=options,)
+            else:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend)
             # a group with `gloo` backend, to allow direct coordination between
             # processes through the CPU.
             cpu_group = torch.distributed.new_group(ranks, backend="gloo")
@@ -190,7 +199,6 @@ class GroupCoordinator:
         assert self.cpu_group is not None
         assert self.device_group is not None
 
-        from vllm.platforms import current_platform
 
         # TODO: fix it for other platforms
         if current_platform.is_cuda_alike():
@@ -818,11 +826,38 @@ def init_distributed_environment(
             "distributed_init_method must be provided when initializing "
             "distributed environment")
         # this backend is used for WORLD
-        torch.distributed.init_process_group(
-            backend=backend,
-            init_method=distributed_init_method,
-            world_size=world_size,
-            rank=rank)
+        if current_platform.is_sophtpu():
+
+            import os
+            os.environ["OMPI_COMM_WORLD_RANK"] = str(rank)
+            os.environ["OMPI_COMM_WORLD_SIZE"] = str(world_size)
+            # logger.info("Initializing SCCL backend...")
+
+            def set_rank_affinity():
+                import psutil
+                cpu_affinity = [rank]
+                p = psutil.Process(os.getpid())
+                p.cpu_affinity(cpu_affinity)
+
+            set_rank_affinity()
+
+            import torch_tpu
+            options = torch_tpu.ProcessGroupSCCLOptions()
+            torch_tpu.tpu.set_chip_map(options, use_rank_table=False)
+            torch_tpu.tpu.set_device(options.chip_map[rank])
+
+            torch.distributed.init_process_group(
+                backend=backend,
+                world_size=world_size,
+                rank=rank,
+                pg_options=options,
+            )
+        else:
+            torch.distributed.init_process_group(
+                backend=backend,
+                init_method=distributed_init_method,
+                world_size=world_size,
+                rank=rank)
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816

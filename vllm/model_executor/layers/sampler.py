@@ -237,11 +237,6 @@ class Sampler(nn.Module):
             logits: (num_tokens, vocab_size).
             sampling_metadata: Metadata for sampling.
         """
-        #import time
-        #import torch_tpu
-        #torch_tpu.tpu.synchronize()
-        #time0 = time.time_ns()
-        #print(f"Sampler time0 {time0 / 1000**2:.3f}ms")
 
         assert logits is not None
         _, vocab_size = logits.shape
@@ -258,9 +253,6 @@ class Sampler(nn.Module):
             # reuse sampling tensors, since "output_tokens" changes
             # between decode runs.
             self._init_sampling_tensors(logits, sampling_metadata)
-        #torch_tpu.tpu.synchronize()
-        #time012 = time.time_ns()
-        #print(f"Sampler time012 {time012 / 1000**2:.3f}ms")
 
         assert self._sampling_tensors is not None
         sampling_tensors = self._sampling_tensors
@@ -269,10 +261,6 @@ class Sampler(nn.Module):
         do_min_p = self._do_min_p
 
         logits = _apply_min_tokens_penalty(logits, sampling_metadata)
-
-        #torch_tpu.tpu.synchronize()
-        #time1 = time.time_ns()
-        #print(f"Sampler time1 {time1 / 1000**2:.3f}ms")
 
         # Apply presence and frequency penalties.
         if do_penalties:
@@ -302,11 +290,6 @@ class Sampler(nn.Module):
         # Compute the log probabilities.
         logprobs = torch.log_softmax(logits, dim=-1, dtype=torch.float).to(device=device)
 
-        #time1-2 cost ~3ms
-        #torch_tpu.tpu.synchronize()
-        #time2 = time.time_ns()
-        #print(f"Sampler time2 {time2 / 1000**2:.3f}ms")
-
         # Sample the next tokens.
         maybe_deferred_sample_results, maybe_sampled_tokens_tensor = _sample(
             probs,
@@ -316,10 +299,6 @@ class Sampler(nn.Module):
             include_gpu_probs_tensor=self.include_gpu_probs_tensor,
             modify_greedy_probs=self._should_modify_greedy_probs_inplace,
         )
-
-        #torch_tpu.tpu.synchronize()
-        #time3 = time.time_ns()
-        #print(f"Sampler time3 {time3 / 1000**2:.3f}ms")
 
         if self.include_gpu_probs_tensor:
             # Since we will defer sampler result Pythonization,
@@ -341,10 +320,6 @@ class Sampler(nn.Module):
                                   SampleResultArgsType)
             prompt_logprobs, sample_logprobs = get_logprobs(
                 logprobs, sampling_metadata, maybe_deferred_sample_results)
-
-        #torch_tpu.tpu.synchronize()
-        #time4 = time.time_ns()
-        #print(f"Sampler time4 {time4 / 1000**2:.3f}ms")
 
         return _build_sampler_output(
             maybe_deferred_sample_results,

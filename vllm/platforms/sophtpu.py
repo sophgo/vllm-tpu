@@ -113,4 +113,4 @@ class SophTpuPlatform(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        return "vllm.distributed.device_communicators.tpu_communicator.SophTpuCommunicator"  # noqa
+        return "vllm.distributed.device_communicators.sophtpu_communicator.SophTpuCommunicator"  # noqa

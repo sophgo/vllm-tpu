@@ -8,8 +8,8 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
-from vllm.distributed import (ensure_model_parallel_initialized,
-                              init_distributed_environment)
+from vllm.distributed import (init_distributed_environment, ensure_model_parallel_initialized,
+                              init_world_group, GroupCoordinator)
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
@@ -18,7 +18,7 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
-from vllm.v1.worker.tpu_model_runner import ExecutionMode, TPUModelRunner
+from vllm.v1.worker.sophtpu_model_runner import ExecutionMode, SophTPUModelRunner
 
 logger = init_logger(__name__)
 
@@ -87,52 +87,18 @@ class SophTPUWorker:
         torch._dynamo.config.cache_size_limit = 128
 
         # Init ModelRunner here, so that we have access to self.device.
-        self.model_runner = TPUModelRunner(self.vllm_config, self.device)
+        self.model_runner = SophTPUModelRunner(self.vllm_config, self.device)
 
     def determine_available_memory(self) -> int:
-        kv_caches: Dict[str, torch.Tensor] = {}
-        kv_cache_spec = self.model_runner.get_kv_cache_spec()
-        for layer_name, layer_spec in kv_cache_spec.items():
-            if isinstance(layer_spec, FullAttentionSpec):
-                dtype = layer_spec.dtype
-
-                # Use an empty tensor instead of `None`` to force Dynamo to pass
-                # it by reference, rather by specializing on the value ``None``.
-                tpu_k_cache = torch.tensor([], dtype=dtype, device=self.device)
-                tpu_v_cache = torch.tensor([], dtype=dtype, device=self.device)
-
-                kv_caches[layer_name] = (tpu_k_cache, tpu_v_cache)
-            else:
-                raise NotImplementedError
-
-        runner_kv_caches: List[torch.Tensor] = []
-        bind_kv_cache(
-            kv_caches,
-            self.vllm_config.compilation_config.static_forward_context,
-            runner_kv_caches)
-
-        self.model_runner.dummy_run(
-            runner_kv_caches,
-            num_tokens=1,
-            seq_len=self.scheduler_config.max_num_batched_tokens,
-            exec_mode=ExecutionMode.PREFILL,
-        )
-
-        # Synchronize before measuring the memory usage.
-        xm.wait_device_ops()
-
-        # Get the maximum amount of memory used by the model weights and
-        # intermediate activations.
-        m = xm.get_memory_info(self.device)
-        total_memory_size = m["bytes_limit"]
-        profiled = m["peak_bytes_used"]  # Weights + intermediate activations.
-
-        # Calculate the TPU KV cache size based on profiling.
-        usable_memory_size = int(total_memory_size *
-                                 self.cache_config.gpu_memory_utilization)
-        tpu_kv_cache_bytes = max(usable_memory_size - profiled, 0)
-
-        return int(tpu_kv_cache_bytes)
+        '''
+        Within the range of GPU memory utilization, 
+        determine the available memory excluding that used by model operation; 
+        subsequent updates should be implemented as soon as possible, 
+        and the maximum number of generated TOKENs 
+        and block size can also be used for calculation. 
+        Unit: bytes        
+        '''
+        return 15769803770
 
     def execute_model(
         self,
@@ -167,6 +133,7 @@ class SophTPUWorker:
         # worker will always be healthy as long as it's running.
         return
 
+_WORLD: Optional[GroupCoordinator] = None
 
 def init_sophtpu_worker_distributed_environment(
     parallel_config: ParallelConfig,

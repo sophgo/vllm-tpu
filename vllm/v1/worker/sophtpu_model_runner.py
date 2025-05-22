@@ -3,11 +3,13 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 from unittest.mock import patch
+import time
 
 import numpy as np
 import torch
 import torch.distributed
 import torch.nn as nn
+import torch_tpu
 
 from vllm.attention import AttentionMetadata
 from vllm.attention.backends.abstract import AttentionType
@@ -20,6 +22,7 @@ from vllm.sampling_params import SamplingType
 from vllm.utils import LayerBlockType, cdiv, is_pin_memory_available
 from vllm.attention.backends.sophtpu_attn import (SophTPUAttentionBackend,
                                                   SophTPUMetadata)
+from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
@@ -180,6 +183,11 @@ class SophTPUModelRunner:
         # Used to initialize positions / context_lens / seq_lens
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int32)
 
+        self.time_records = {
+            "inference": [],
+            "data_transfer": []
+        }
+        self.num_tokens = 0
     def _update_states(self, scheduler_output: "SchedulerOutput") -> bool:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -391,184 +399,136 @@ class SophTPUModelRunner:
         return PromptDecodeInfo(prompt_req_ids, decode_req_ids,
                                 prompt_scheduled_tokens)
 
-    def _prepare_prompt(self, req_index: int,
-                        num_scheduled_tokens: int) -> PromptData:
-        num_computed_tokens = self.input_batch.num_computed_tokens_cpu[
-            req_index]
-        num_prompt_tokens = self.input_batch.num_prompt_tokens[req_index]
+    def _prepare_prompt(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, List[int]]:
+        input_tokens: List[int] = []
+        input_positions: List[int] = []
+        slot_mapping: List[int] = []
+        prompt_lens: List[int] = []
+        context_lens: List[int] = []
 
-        # Must be prompt
-        assert num_computed_tokens < num_prompt_tokens
+        req_ids = self.input_batch.req_ids
+        block_tables = []
+        max_blocks = 0
 
-        # Prompt len
-        prompt_len = num_scheduled_tokens
-        padded_prompt_len = _get_padded_prompt_len(prompt_len)
-        assert padded_prompt_len <= self.max_model_len
+        for req_id in req_ids:
+            req_state = self.requests[req_id]
+            prompt_token_ids = req_state.prompt_token_ids
+            block_ids = req_state.block_ids
+            num_computed = req_state.num_computed_tokens
+            start_idx = max(0, len(prompt_token_ids) - self.sliding_window) if self.sliding_window else 0
+            process_tokens = prompt_token_ids[num_computed:]
 
-        # Seq len
-        seq_len = num_computed_tokens + prompt_len
-        padded_seq_len = num_computed_tokens + padded_prompt_len
+            # input_tokens\input_positions\prompt_lens\context_lens
+            input_tokens.extend(process_tokens)
+            input_positions.extend(range(num_computed, num_computed + len(process_tokens)))
+            prompt_lens.append(len(process_tokens))
+            context_lens.append(num_computed)
 
-        # Input tokens
-        input_tokens_cpu = self.input_batch.token_ids_cpu_tensor[
-            req_index, num_computed_tokens:padded_seq_len]
-        input_tokens_cpu[prompt_len:] = 0
+            # slot_mapping
+            for i in range(len(process_tokens)):
+                global_pos = num_computed + i
+                if global_pos < start_idx:
+                    slot_mapping.append(_PAD_SLOT_ID)
+                    continue
+                block_idx = (global_pos - start_idx) // self.block_size
+                block_offset = (global_pos - start_idx) % self.block_size
+                slot = block_ids[block_idx] * self.block_size + block_offset
+                slot_mapping.append(slot)
 
-        # Input positions
-        input_positions_np = self.input_positions_np[
-            self.cur_swap_id][:padded_prompt_len]
-        np.add(num_computed_tokens,
-               self.arange_np[:padded_prompt_len],
-               out=input_positions_np)
-        input_positions_np[prompt_len:] = 0
+            # block_tables
+            req_blocks = [bid for bid in block_ids 
+                        if bid >= (start_idx // self.block_size)]
+            block_tables.append(req_blocks)
+            max_blocks = max(max_blocks, len(req_blocks))
 
-        # Slot mapping
-        block_table_np = \
-            self.input_batch.block_table.get_numpy_array()
-        block_numbers_np = block_table_np[req_index, input_positions_np //
-                                          self.block_size]
-        block_offsets_np = input_positions_np % self.block_size
+        # to tensor
+        input_tokens = torch.tensor(input_tokens, dtype=torch.int32, device=self.device)
+        input_positions = torch.tensor(input_positions, dtype=torch.int32, device=self.device)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device=self.device)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, device="cpu")
+        prompt_lens_tensor = torch.tensor(prompt_lens, dtype=torch.int32, device="cpu")
+        padded_block_tables = [seq + [0] * (max_blocks - len(seq)) for seq in block_tables]
+        block_tables_tensor = torch.tensor(padded_block_tables, dtype=torch.int32, device=self.device)
+        block_tables_tensor *= self.block_size
 
-        slot_mapping_np = self.slot_mapping_np[
-            self.cur_swap_id][:padded_prompt_len]
-        np.add(block_numbers_np * self.block_size,
-               block_offsets_np,
-               out=slot_mapping_np)
-        slot_mapping_np[prompt_len:] = _PAD_SLOT_ID
-
-        # Block table
-        block_table_cpu = None
-        if num_computed_tokens > 0:
-            block_table_cpu = self.input_batch.block_table.get_cpu_tensor()
-            block_table_cpu = block_table_cpu[req_index]
-
-        # Context len
-        self.prompt_context_lens_cpu[self.cur_swap_id][0] = 0
-        if num_computed_tokens > 0:
-            self.prompt_context_lens_cpu[self.cur_swap_id][0] = seq_len
-
-        # Effective query len
-        self.prompt_effective_query_lens_cpu[self.cur_swap_id][0] = prompt_len
-
-        # Get final tensors
-        input_tokens = input_tokens_cpu.reshape(1, -1).to(self.device)
-        input_positions = self.input_positions_cpu[
-            self.cur_swap_id][:padded_prompt_len].reshape(1,
-                                                          -1).to(self.device)
-        slot_mapping = self.slot_mapping_cpu[
-            self.cur_swap_id][:padded_prompt_len].reshape(1,
-                                                          -1).to(self.device)
-        block_table = block_table_cpu.reshape(1, -1).to(
-            self.device) if block_table_cpu is not None else None
-
-        context_lens = self.prompt_context_lens_cpu[self.cur_swap_id].to(
-            self.device)
-        effective_query_lens = self.prompt_effective_query_lens_cpu[
-            self.cur_swap_id].to(self.device)
-
-        self.swap_step()
-
-        # Attn metadata
         attn_metadata = SophTPUMetadata(
-            num_prefills=1,
-            num_prefill_tokens=0,  # NOTE: This is not used.
-            num_decode_tokens=0,
-            slot_mapping=slot_mapping,
-            multi_modal_placeholder_index_maps=None,
+            num_decode_tokens = 0,
+            slot_mapping = slot_mapping,
+            num_prefills=len(req_ids),
+            num_prefill_tokens=len(input_tokens),
             enable_kv_scales_calculation=True,
-            block_tables=block_table,
+            block_tables=block_tables_tensor,
             context_lens=context_lens,
-            effective_query_lens=effective_query_lens,
+            effective_query_lens=prompt_lens_tensor,
+            multi_modal_placeholder_index_maps=None
         )
 
         return PromptData(input_tokens, input_positions, attn_metadata)
 
+
     def _prepare_decode(
         self,
-        decode_req_ids: List[str],
     ) -> DecodeData:
-        # Batch size
-        batch_size = len(decode_req_ids)
-        padded_batch_size = _get_padded_batch_size(batch_size)
-        assert padded_batch_size <= self.max_model_len
+        input_tokens: List[int] = []
+        input_positions: List[int] = []
+        slot_mapping: List[int] = []
+        context_lens: List[int] = []
 
-        # Init [0 .. batch_size - 1]
-        req_indices_np = self.arange_np[:padded_batch_size]
+        req_ids = self.input_batch.req_ids
+        block_tables = []
+        max_blocks = 0
 
-        # Input positions
-        input_positions_np = self.input_positions_np[
-            self.cur_swap_id][:padded_batch_size]
-        np.add(self.input_batch.num_computed_tokens_cpu[:padded_batch_size],
-               0,
-               out=input_positions_np)
-        input_positions_np[batch_size:] = 0
-        input_positions_cpu = self.input_positions_cpu[
-            self.cur_swap_id][:padded_batch_size]
+        for req_id in req_ids:
+            req_state = self.requests[req_id]
+            generation_token = req_state.output_token_ids[-1]
+            seq_len = req_state.num_tokens
+            position = seq_len - 1
+            seq_len = seq_len if self.sliding_window is None else min(
+                seq_len, self.sliding_window) 
+            block_ids = req_state.block_ids
+            start_idx = max(0, seq_len - self.sliding_window) if self.sliding_window else 0
+            
+            # input_tokens\input_positions\context_lens
+            input_tokens.append(generation_token)
+            input_positions.append(position)
+            context_lens.append(seq_len)
 
-        # Input tokens
-        token_indices_np = (
-            input_positions_np +
-            req_indices_np * self.input_batch.token_ids_cpu.shape[1])
-        input_tokens_cpu = self.input_ids_cpu[
-            self.cur_swap_id][:padded_batch_size]
-        torch.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
-                           0,
-                           torch.from_numpy(token_indices_np),
-                           out=input_tokens_cpu)
-        input_tokens_cpu[batch_size:] = 0
+            # slot_mapping
+            global_pos = req_state.num_computed_tokens
+            if global_pos < start_idx:
+                slot_mapping.append(_PAD_SLOT_ID)
+                continue
+            block_idx = (global_pos - start_idx) // self.block_size
+            block_offset = (global_pos - start_idx) % self.block_size
+            slot = block_ids[block_idx] * self.block_size + block_offset
+            slot_mapping.append(slot)
 
-        # Slot mapping
-        block_table_indices_np = (
-            req_indices_np * self.max_num_blocks_per_req +
-            input_positions_np // self.block_size)
+            # block_tables
+            req_blocks = [bid for bid in block_ids 
+                        if bid >= (start_idx // self.block_size)]
+            block_tables.append(req_blocks)
+            max_blocks = max(max_blocks, len(req_blocks))
 
-        block_table_cpu = self.input_batch.block_table.get_cpu_tensor()
+        # to tensor
+        input_tokens = torch.tensor(input_tokens, dtype=torch.int32, device=self.device)
+        input_positions = torch.tensor(input_positions, dtype=torch.int32, device=self.device)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device=self.device)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, device="cpu")
+        padded_block_tables = [seq + [0] * (max_blocks - len(seq)) for seq in block_tables]
+        block_tables_tensor = torch.tensor(padded_block_tables, dtype=torch.int32, device=self.device)
+        block_tables_tensor *= self.block_size
 
-        block_numbers_np = block_table_cpu.flatten(
-        )[block_table_indices_np].numpy()
-
-        block_offsets_np = input_positions_np % self.block_size
-
-        slot_mapping_np = self.slot_mapping_np[
-            self.cur_swap_id][:padded_batch_size]
-        np.add(block_numbers_np * self.block_size,
-               block_offsets_np,
-               out=slot_mapping_np)
-        slot_mapping_np[batch_size:] = _PAD_SLOT_ID
-
-        block_table_cpu = block_table_cpu[:padded_batch_size]
-
-        # Context lens
-        context_lens_np = self.decode_context_lens_np[
-            self.cur_swap_id][:padded_batch_size]
-        np.add(self.input_batch.num_computed_tokens_cpu[:padded_batch_size],
-               1,
-               out=context_lens_np)
-        context_lens_np[batch_size:] = 0
-
-        # Get final tensors
-        input_tokens = input_tokens_cpu.reshape(-1, 1).to(self.device)
-        input_positions = input_positions_cpu.reshape(-1, 1).to(self.device)
-        slot_mapping = self.slot_mapping_cpu[
-            self.cur_swap_id][:padded_batch_size].reshape(-1,
-                                                          1).to(self.device)
-        block_table = block_table_cpu.to(self.device)
-        context_lens = self.decode_context_lens_cpu[
-            self.cur_swap_id][:padded_batch_size].to(self.device)
-
-        self.swap_step()
-
-        # Attn metadata
         attn_metadata = SophTPUMetadata(
             num_prefills=0,
             num_prefill_tokens=0,
-            num_decode_tokens=padded_batch_size,
+            num_decode_tokens=len(req_ids),
             slot_mapping=slot_mapping,
             multi_modal_placeholder_index_maps=None,
-            enable_kv_scales_calculation=True,
-            block_tables=block_table,
+            enable_kv_scales_calculation=False,
+            block_tables=block_tables_tensor,
             context_lens=context_lens,
-            effective_query_lens=None,
         )
 
         return DecodeData(input_tokens=input_tokens,
@@ -579,115 +539,80 @@ class SophTPUModelRunner:
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> ModelRunnerOutput:
         # Update cached state
         self._update_states(scheduler_output)
 
-        # If necessary, swap decodes/prompts to have all decodes on the start
-        ensure_decodes_first(self.input_batch)
-
-        # Prepare prompts/decodes info
         pd_info = self._get_prompts_and_decodes(scheduler_output)
-
-        # Init
         num_prompts = len(pd_info.prompt_req_ids)
         num_decodes = len(pd_info.decode_req_ids)
-        decode_data = None
         sampled_token_ids = [0] * self.input_batch.num_reqs
 
-        # Run each prompt individually
-        is_first = True
-        for i in range(num_prompts):
-            req_id = pd_info.prompt_req_ids[i]
-            req_index = num_decodes + i
-            assert req_index == self.input_batch.req_id_to_index[
-                req_id]  # TODO: Remove
+        if num_prompts > 0 and num_decodes > 0:
+            raise NotImplementedError(
+                "Current does not support mixed batch inference " \
+                "with both prefill and decode.")
+        elif num_prompts > 0:
+            model_input = self._prepare_prompt()
+        elif num_decodes > 0:
+            model_input = self._prepare_decode()
+        else:
+            model_input = None
+
+        torch_tpu.tpu.synchronize()
+        t1 = time.time_ns()
+        with set_forward_context(model_input.attn_metadata,
+                                    self.vllm_config):
+            assert self.model is not None
+            hidden_or_intermediate_states = self.model(input_ids=model_input.input_tokens,
+                                                        positions=model_input.input_positions,
+                                                        kv_caches=self.kv_caches,
+                                                        attn_metadata=model_input.attn_metadata,
+                                                        intermediate_tensors=intermediate_tensors,)  
+            #TODO:For mixed batches of prefill and decode, 
+            # the prepare_decode can be executed in parallel during the prefill inference phase.
+        logits = self.model.compute_logits(hidden_or_intermediate_states, None)
+        torch_tpu.tpu.synchronize()
+        t2 = time.time_ns()
+
+        # Greedy sampling.
+        argmax_token_ids = torch.argmax(logits, dim=-1, keepdim=True)
+        argmax_token_ids = argmax_token_ids.squeeze(dim=-1)
+        
+        torch_tpu.tpu.synchronize()
+        t3 = time.time_ns()
+        # Transfer sampled tokens from TPU to CPU. 
+        generate_token_ids_cpu = argmax_token_ids.cpu()
+        torch_tpu.tpu.synchronize()
+        t4 = time.time_ns()
+
+        # self._statistics_time(t1, t2, t3, t4)
+
+        generate_token_ids_list = generate_token_ids_cpu.tolist()
+        # Update cached state
+        req_ids = pd_info.prompt_req_ids + pd_info.decode_req_ids
+        for i in range(self.input_batch.num_reqs):
+            req_id = req_ids[i]
+            req_index = i
+            assert req_index == self.input_batch.req_id_to_index[req_id]
             req_state = self.requests[req_id]
-            num_scheduled_tokens = pd_info.prompt_scheduled_tokens[i]
-            prompt_len = num_scheduled_tokens
-            seq_len = req_state.num_computed_tokens + num_scheduled_tokens
-
-            # Prepare first prompt
-            if is_first:
-                prompt_data = self._prepare_prompt(req_index,
-                                                   num_scheduled_tokens)
-                is_first = False
-
-            # Run forward pass
-            with set_forward_context(prompt_data.attn_metadata,
-                                     self.vllm_config):
-                assert self.model is not None
-                selected_token_ids = self.model(prompt_data.input_tokens,
-                                                prompt_data.input_positions,
-                                                prompt_data.attn_metadata,
-                                                self.kv_caches)
-
-            # In parallel to TPU execution, prepare the next iteration
-            if i < num_prompts - 1:
-                # There is next prompt => prepare it
-                prompt_data = self._prepare_prompt(
-                    req_index + 1, pd_info.prompt_scheduled_tokens[i + 1])
-            elif i == num_prompts - 1 and num_decodes > 0:
-                # There is next decode => prepare it
-                decode_data = self._prepare_decode(pd_info.decode_req_ids)
-
-            # Update cached state (if prompt is fully done)
-            if seq_len >= len(req_state.prompt_token_ids):
-                # Transfer sampled tokens from TPU to CPU
-                selected_token_ids_cpu = selected_token_ids.cpu()
-
-                # Get output token
-                token_id = selected_token_ids_cpu[prompt_len - 1].item()
-                sampled_token_ids[req_index] = token_id
-
-                # Add output token to the request
-                self.input_batch.token_ids_cpu[req_index, seq_len] = token_id
-                self.input_batch.num_tokens[req_index] += 1
-                req_state.output_token_ids.append(token_id)
-
-        # Run decodes (a single batch)
-        if num_decodes > 0:
-
-            # Prepare decode (if was not yet prepared)
-            if decode_data is None:
-                decode_data = self._prepare_decode(pd_info.decode_req_ids)
-
-            # Run forward pass
-            with set_forward_context(decode_data.attn_metadata,
-                                     self.vllm_config):
-                assert self.model is not None
-                selected_token_ids = self.model(decode_data.input_tokens,
-                                                decode_data.input_positions,
-                                                decode_data.attn_metadata,
-                                                self.kv_caches)
-
-            # Transfer sampled tokens from TPU to CPU
-            decode_token_ids_cpu = selected_token_ids.cpu()
-            # Convert to list
-            decode_token_ids_list = decode_token_ids_cpu.tolist()
-
-            # Update cached state for each decode request
-            for i in range(num_decodes):
-                req_id = pd_info.decode_req_ids[i]
-                req_index = i
-                assert req_index == self.input_batch.req_id_to_index[
-                    req_id]  # TODO: Remove
-                req_state = self.requests[req_id]
-                seq_len = req_state.num_computed_tokens + 1
-
-                token_id = decode_token_ids_list[i]
-                sampled_token_ids[req_index] = token_id
-
-                self.input_batch.token_ids_cpu[req_index, seq_len] = token_id
-                self.input_batch.num_tokens[req_index] += 1
-                req_state.output_token_ids.append(token_id)
+            seq_len = req_state.num_computed_tokens + 1
+            if num_prompts > 0:
+                generate_token_index_ = sum(pd_info.prompt_scheduled_tokens[:i+1])
+                token_id = generate_token_ids_list[generate_token_index_-1]
+            else: 
+                token_id = generate_token_ids_list[i]
+            sampled_token_ids[req_index] = token_id
+            self.input_batch.token_ids_cpu[req_index, seq_len] = token_id
+            self.input_batch.num_tokens[req_index] += 1
+            req_state.output_token_ids.append(token_id)
 
         # Create output.
         all_req_ids = pd_info.decode_req_ids + pd_info.prompt_req_ids
         prompt_logprobs_dict: Dict[str, Optional[LogprobsTensors]] = {}
         for req_id in all_req_ids:
             prompt_logprobs_dict[req_id] = None
-
         model_runner_output = ModelRunnerOutput(
             req_ids=all_req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
@@ -696,7 +621,7 @@ class SophTPUModelRunner:
             logprobs=None,
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
-
+        
         return model_runner_output
 
     def load_model(self) -> None:
@@ -892,10 +817,10 @@ class SophTPUModelRunner:
                     layer_spec.head_size)
                 dtype = layer_spec.dtype
 
-                tpu_k_cache = torch.zeros(kv_cache_shape,
+                tpu_k_cache = torch.empty(kv_cache_shape,
                                           dtype=dtype,
                                           device=self.device)
-                tpu_v_cache = torch.zeros_like(tpu_k_cache)
+                tpu_v_cache = torch.empty_like(tpu_k_cache)
 
                 kv_caches[layer_name] = (tpu_k_cache, tpu_v_cache)
             else:
@@ -905,6 +830,39 @@ class SophTPUModelRunner:
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
             self.kv_caches)
+        
+    def _statistics_time(self, t1, t2, t3, t4):
+        import os
+        DECODE_TOKEN_LEN = int(os.getenv("DECODE_TOKEN_LEN", "128"))
+        self.num_tokens += 1
+        if self.num_tokens > DECODE_TOKEN_LEN: 
+            self.time_records["inference"].append((t2 - t1)/1e6)
+            self.time_records["data_transfer"].append((t4 - t3)/1e6)
+            if self.num_tokens == int(DECODE_TOKEN_LEN * 2):
+                results = {}
+                for key, values in self.time_records.items():
+                    if not values:
+                        print(f"警告: {key}列表为空，无法统计时间")
+                        continue
+                    arr = np.array(values)
+                    stats = {
+                        "count": len(arr),
+                        "mean": np.mean(arr),
+                        "median": np.median(arr),
+                        "min": np.min(arr),
+                        "max": np.max(arr),
+                        "std": np.std(arr)
+                    }
+                    results[key] = stats
+                print("\n===== 时间性能分析报告 =====")
+                for key, stats in results.items():
+                    print(f"\n【{key.upper()} 统计】")
+                    print(f"  推理token数: {stats['count']}")
+                    print(f"  平均时间: {stats['mean']:.2f} ms")
+                    print(f"  中位数: {stats['median']:.2f} ms")
+                    print(f"  最短时间: {stats['min']:.2f} ms")
+                    print(f"  最长时间: {stats['max']:.2f} ms")
+                    print(f"  标准差: {stats['std']:.2f} ms")
 
 class ModelWrapperV1(nn.Module):
 

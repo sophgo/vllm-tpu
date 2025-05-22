@@ -616,9 +616,6 @@ class SophTPUModelRunner(ModelRunnerBase[ModelInputForSophTPUWithSamplingMetadat
                                              or {},
                                              device=self.device))
 
-        #import time
-        #end_time1 = time.time_ns()
-        #print(f"End time1 {end_time1 / 1000**2:.3f}ms")
         # Compute the logits in the last pipeline stage.
         if not get_pp_group().is_last_rank:
             return hidden_or_intermediate_states
@@ -627,16 +624,9 @@ class SophTPUModelRunner(ModelRunnerBase[ModelInputForSophTPUWithSamplingMetadat
                 and self.observability_config.collect_model_forward_time):
             model_forward_end_time = time.time()
 
-        #end_time2 = time.time_ns()
-        #print(f"End time2 {end_time2 / 1000**2:.3f}ms")
- 
         # Compute the logits.
         logits = self.model.compute_logits(hidden_or_intermediate_states,
                                            model_input.sampling_metadata)
-        #import torch_tpu
-        #torch_tpu.tpu.synchronize()
-        #end_time3 = time.time_ns()
-        #print(f"End time3 {end_time3 / 1000**2:.3f}ms")
  
         # Only perform sampling in the driver worker.
         if not self.is_driver_worker:
@@ -651,11 +641,6 @@ class SophTPUModelRunner(ModelRunnerBase[ModelInputForSophTPUWithSamplingMetadat
             sampling_metadata=model_input.sampling_metadata,
         )
 
-        #torch_tpu.tpu.synchronize()
- 
-        #end_time4 = time.time_ns()
-        #print(f"End time4 {end_time4 / 1000**2:.3f}ms")
- 
         if (self.observability_config is not None
                 and self.observability_config.collect_model_forward_time
                 and output is not None):
@@ -667,9 +652,6 @@ class SophTPUModelRunner(ModelRunnerBase[ModelInputForSophTPUWithSamplingMetadat
             # the communication time as well.
             output.model_forward_time = model_forward_time
 
-        #end_time5 = time.time_ns()
-        #print(f"End time5 {end_time5 / 1000**2:.3f}ms")
- 
         return [output]
 
 class ModelWrapper(nn.Module):

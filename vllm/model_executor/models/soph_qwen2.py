@@ -31,23 +31,26 @@ from transformers import Qwen2Config
 
 from vllm.attention import Attention, AttentionMetadata, AttentionType
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, VllmConfig
+from vllm.config import CacheConfig, VllmConfig, ParallelConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
+                                               ColumnParallelLinear,
                                                QKVParallelLinear,
-                                               RowParallelLinear,
-                                               SophQKVParallelLinear,
-                                               SophRowParallelLinear)
+                                               RowParallelLinear)
+
+from vllm.model_executor.layers.soph_linear import (SophQKVParallelLinear,
+                                                    SophRowParallelLinear)
+
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.pooler import Pooler, PoolingType
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead, VocabParallelEmbedding)
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.soph_embedding import SophEmbedding
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.pooling_metadata import PoolingMetadata
@@ -61,7 +64,9 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, WeightsMapper,
                     maybe_prefix)
 
 from vllm.platforms import current_platform
-
+from vllm.distributed import (divide, get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              tensor_model_parallel_all_reduce)
 logger = init_logger(__name__)
 
 def soph_rmsnorm(weight, output, hidden_states, variance_epsilon, residual=None):
@@ -119,8 +124,9 @@ class Qwen2MLP(nn.Module):
             self.gate_qweight, self.gate_qzeros, self.gate_scales = self.gate_proj.qweight.data, self.gate_proj.qzeros.data, self.gate_proj.scales.data
             self.down_qweight, self.down_qzeros, self.down_scales = self.down_proj.qweight.data, self.down_proj.qzeros.data, self.down_proj.scales.data
         else:
-            self.down_proj_weight = self.down_proj.weight.transpose(0, 1).contiguous()
-
+            self.up_proj_weight, self.gate_proj_weight = self.up_proj.weight.data, self.gate_proj.weight.data
+            self.down_proj_weight = self.down_proj.weight.data.transpose(0,1).contiguous()
+        self.tp_size = get_tensor_model_parallel_world_size()
     def forward(self, x, output):
         if self.quant_config:
             torch.ops.my_ops.llama_mlp_gptq_forward(x,
@@ -131,8 +137,11 @@ class Qwen2MLP(nn.Module):
                                                     self.bits,
                                                     output)
         else:
-            torch.ops.my_ops.llama_mlp_forward(x, self.up_proj.weight, self.gate_proj.weight, self.down_proj_weight, None, None, None, output, False)
-        return x
+            # self.down_proj_weight = self.down_proj.weight.data.transpose(0,1).contiguous()
+            torch.ops.my_ops.llama_mlp_forward(x, self.up_proj_weight, self.gate_proj_weight, self.down_proj_weight, None, None, None, output, False)
+        if self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output
 
 class Qwen2Attention(nn.Module):
 
@@ -225,7 +234,6 @@ class Qwen2Attention(nn.Module):
         value = value.view(-1, self.num_kv_heads, self.head_dim)
 
         block_size = int(kv_cache[1].shape[1])
-        attn_metadata.block_tables = attn_metadata.block_tables.squeeze(1)
 
         max_s = query.shape[0]
 
@@ -235,6 +243,7 @@ class Qwen2Attention(nn.Module):
             save_slots = attn_metadata.block_tables
             fetch_slots = None
             input_lengths = attn_metadata.effective_query_lens
+            max_s = input_lengths.max().item()
 
             torch.ops.my_ops.llama_attention(attention_output[1], query, key, value, kv_cache[0], kv_cache[1],
                                     cos, sin, input_lengths, save_slots, fetch_slots, None,
@@ -245,7 +254,7 @@ class Qwen2Attention(nn.Module):
             save_slots = attn_metadata.slot_mapping
             fetch_slots = attn_metadata.block_tables
             input_lengths = attn_metadata.context_lens
-
+            max_s = input_lengths.max().item()
             torch.ops.my_ops.llama_attention(attention_output[1], query, key, value, kv_cache[0], kv_cache[1],
                                     cos, sin, input_lengths, save_slots, fetch_slots, None,
                                     attn_metadata.block_tables.size(1), max_s, block_size, self.scaling, 3)
@@ -305,6 +314,8 @@ class Qwen2DecoderLayer(nn.Module):
                                                 eps=config.rms_norm_eps)
 
         self.eps = config.rms_norm_eps
+        self.input_layernorm_weight = self.input_layernorm.weight.data
+        self.post_attention_layernorm_weight = self.post_attention_layernorm.weight.data
 
     #def forward(
     #    self,
@@ -348,7 +359,7 @@ class Qwen2DecoderLayer(nn.Module):
         return hidden_states, residual
 
         """
-        res = soph_rmsnorm(self.input_layernorm.weight, rms_buffer, hidden_states, self.eps, residual)
+        res = soph_rmsnorm(self.input_layernorm_weight, rms_buffer, hidden_states, self.eps, residual)
 
         attn_output = self.self_attn(
             rms_buffer,
@@ -359,7 +370,7 @@ class Qwen2DecoderLayer(nn.Module):
             attn_buffer
         )
 
-        attn_res = soph_rmsnorm(self.post_attention_layernorm.weight, rms_buffer, attn_output, self.eps, res)
+        attn_res = soph_rmsnorm(self.post_attention_layernorm_weight, rms_buffer, attn_output, self.eps, res)
 
         self.mlp(rms_buffer, mlp_buffer)
 
@@ -403,7 +414,7 @@ class Qwen2Model(nn.Module):
 
         if get_pp_group().is_first_rank or (config.tie_word_embeddings
                                             and get_pp_group().is_last_rank):
-            self.embed_tokens = VocabParallelEmbedding(
+            self.embed_tokens = SophEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
@@ -448,6 +459,7 @@ class Qwen2Model(nn.Module):
         self.rms_buffer = None
 
         self.eps = config.rms_norm_eps
+        self.tp_size = get_tensor_model_parallel_world_size()
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -481,7 +493,7 @@ class Qwen2Model(nn.Module):
         # {MM-QKV output, Attention output, Attention_FC output}
             self.attn_buffer = []
             self.attn_buffer.append(hidden_states.new_empty(hidden_states.shape[0], (self.num_heads + 2 * self.num_kv_heads) * self.head_dim))
-            self.attn_buffer.append(hidden_states.new_empty((hidden_states.shape[0], self.num_heads, self.head_dim)))
+            self.attn_buffer.append(hidden_states.new_empty((hidden_states.shape[0], self.num_heads // self.tp_size, self.head_dim)))
             self.attn_buffer.append(torch.empty_like(hidden_states))
             self.rms_buffer = torch.empty_like(hidden_states)
         mlp_buffer = self.mlp_buffer
@@ -490,13 +502,6 @@ class Qwen2Model(nn.Module):
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            #hidden_states, residual = layer(
-            #    positions,
-            #    hidden_states,
-            #    kv_caches[i - self.start_layer],
-            #    attn_metadata,
-            #    residual,
-            #)
             hidden_states, residual = layer(
                 hidden_states,
                 kv_caches[i - self.start_layer],
@@ -526,6 +531,8 @@ class Qwen2Model(nn.Module):
             ("qkv_proj", "q_proj", "q"),
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
+            # ("gate_up_proj", "gate_proj", 0),
+            # ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: Set[str] = set()
@@ -639,11 +646,6 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata, intermediate_tensors,
                                    inputs_embeds)
-        #import time
-        #import torch_tpu
-        #torch_tpu.tpu.synchronize()
-        #end_time = time.time_ns()
-        #print(f"End time set {end_time / 1000**2:.3f}ms")
         return hidden_states
 
     def compute_logits(
@@ -651,6 +653,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
+        self.logits_processor.use_all_gather = True
         logits = self.logits_processor(self.lm_head, hidden_states,
                                        sampling_metadata)
         return logits

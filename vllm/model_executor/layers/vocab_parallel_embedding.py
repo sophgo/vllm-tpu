@@ -413,7 +413,7 @@ class VocabParallelEmbedding(torch.nn.Module):
             masked_input = input_
         # Get the embeddings.
         output_parallel = self.quant_method.embedding(self,
-                                                      masked_input.int() if current_platform.is_sophtpu() else masked_input.long())
+                                                      masked_input.long())
         # Mask the output embedding.
         if self.tp_size > 1:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
@@ -428,7 +428,6 @@ class VocabParallelEmbedding(torch.nn.Module):
         s += f', num_embeddings_padded={self.num_embeddings_padded}'
         s += f', tp_size={self.tp_size}'
         return s
-
 
 class ParallelLMHead(VocabParallelEmbedding):
     """Parallelized LM head.
