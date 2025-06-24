@@ -137,8 +137,8 @@ class Qwen2MLP(nn.Module):
                                                     self.bits,
                                                     output)
         else:
-            # self.down_proj_weight = self.down_proj.weight.data.transpose(0,1).contiguous()
-            torch.ops.my_ops.llama_mlp_forward(x, self.up_proj_weight, self.gate_proj_weight, self.down_proj_weight, None, None, None, output, False)
+            #self.down_proj_weight = self.down_proj.weight.data.transpose(0,1).contiguous()
+            torch.ops.my_ops.llama_mlp_forward(x, self.up_proj_weight, self.gate_proj_weight, self.down_proj_weight, None, None, None, None, None, None, output, False)
         if self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
         return output

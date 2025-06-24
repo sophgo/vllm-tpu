@@ -451,7 +451,6 @@ class SophTPUModelRunner:
         prompt_lens_tensor = torch.tensor(prompt_lens, dtype=torch.int32, device="cpu")
         padded_block_tables = [seq + [0] * (max_blocks - len(seq)) for seq in block_tables]
         block_tables_tensor = torch.tensor(padded_block_tables, dtype=torch.int32, device=self.device)
-        block_tables_tensor *= self.block_size
 
         attn_metadata = SophTPUMetadata(
             num_decode_tokens = 0,
@@ -518,7 +517,6 @@ class SophTPUModelRunner:
         context_lens = torch.tensor(context_lens, dtype=torch.int32, device="cpu")
         padded_block_tables = [seq + [0] * (max_blocks - len(seq)) for seq in block_tables]
         block_tables_tensor = torch.tensor(padded_block_tables, dtype=torch.int32, device=self.device)
-        block_tables_tensor *= self.block_size
 
         attn_metadata = SophTPUMetadata(
             num_prefills=0,

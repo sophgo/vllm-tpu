@@ -268,8 +268,6 @@ class ModelInputForSophTPUBuilder(ModelRunnerInputBuilderBase[ModelInputForSophT
         )
         for i, request_blocks in enumerate(block_tables):
             block_tables_tensor[i, :len(request_blocks)] = torch.tensor(request_blocks)
-        if current_platform.is_sophtpu:
-            block_tables_tensor *= self.block_size
         # block_tables_tensor = block_tables_tensor.to(self.device)
         num_prompt_tokens = len(input_tokens)
 
@@ -350,23 +348,21 @@ class ModelInputForSophTPUBuilder(ModelRunnerInputBuilderBase[ModelInputForSophT
                 slot = block_number * self.block_size + block_offset
                 slot_mapping.append([slot])
 
-        input_tokens = torch.tensor(input_tokens, 
-                                    dtype=torch.int32, 
+        input_tokens = torch.tensor(input_tokens,
+                                    dtype=torch.int32,
                                     device=self.device)
-        input_positions = torch.tensor(input_positions, 
-                                       dtype=torch.int32, 
+        input_positions = torch.tensor(input_positions,
+                                       dtype=torch.int32,
                                        device=self.device)
-        slot_mapping = torch.tensor(slot_mapping, 
-                                    dtype=torch.int32, 
+        slot_mapping = torch.tensor(slot_mapping,
+                                    dtype=torch.int32,
                                     device=self.device)
-        context_lens = torch.tensor(context_lens, 
-                                    dtype=torch.int32, 
+        context_lens = torch.tensor(context_lens,
+                                    dtype=torch.int32,
                                     device="cpu")
         block_tables = torch.tensor(self.block_tables[:batch_idx, :],
-                                    dtype=torch.int32, 
+                                    dtype=torch.int32,
                                     device=self.device)
-        if current_platform.is_sophtpu:
-            block_tables *= self.block_size
         attn_metadata = self.attn_backend.make_metadata(
             num_prefills=0,
             num_prefill_tokens=0,
