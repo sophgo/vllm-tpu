@@ -33,6 +33,20 @@ from vllm.model_executor.layers.linear import (QKVParallelLinear,
 
 logger = init_logger(__name__)
 
+def soph_to_dtype(tensor, dtype, to_dtype=True):
+    if (
+        tensor.dtype
+        not in [
+            torch.float8_e4m3fn,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        ]
+        and to_dtype
+    ):
+        return tensor.to(dtype=dtype)
+    else:
+        return tensor
 
 class SophQKVParallelLinear(QKVParallelLinear):
     """
@@ -128,8 +142,17 @@ class SophRowParallelLinear(RowParallelLinear):
             output = output_parallel
 
         output_bias = self.bias if self.skip_bias_add else None
-
         return output, output_bias
+    
+    def process_weights_after_loading(self, name, *prefix):
+        self.weight.data = soph_to_dtype(self.weight.data, self.params_dtype)
+        if hasattr(self, 'weight_scale_inv') and self.weight_scale_inv is not None:
+            self.weight_scale_inv.data = soph_to_dtype(self.weight_scale_inv.data, self.params_dtype)
+        if 'mlp' in name:
+            self.weight.data = self.weight.data.transpose(0,1).contiguous()
+            if hasattr(self, 'weight_scale_inv') and self.weight_scale_inv is not None:
+                self.weight_scale_inv.data = self.weight_scale_inv.data.transpose(0,1).contiguous()
+
 
 class SophColumnParallelLinear(ColumnParallelLinear):
     """
@@ -170,6 +193,11 @@ class SophColumnParallelLinear(ColumnParallelLinear):
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+    
+    def process_weights_after_loading(self, *prefix):
+        self.weight.data = soph_to_dtype(self.weight.data, self.params_dtype)
+        if hasattr(self, 'weight_scale_inv') and self.weight_scale_inv is not None:
+            self.weight_scale_inv.data = soph_to_dtype(self.weight_scale_inv.data, self.params_dtype)
 
 class SophReplicatedLinear(ReplicatedLinear):
     """
@@ -210,3 +238,9 @@ class SophReplicatedLinear(ReplicatedLinear):
                                             bias)
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
+
+    def process_weights_after_loading(self, *prefix):
+        self.weight.data = soph_to_dtype(self.weight.data, self.params_dtype)
+        if hasattr(self, 'weight_scale_inv') and self.weight_scale_inv is not None:
+            self.weight_scale_inv.data = soph_to_dtype(self.weight_scale_inv.data, self.params_dtype)
+

@@ -138,11 +138,11 @@ def llama_w4a16_reorder(src_weight_file, dst_weight_file, groupsize, dtype):
 def weight_reorder(model_id, quantize, dtype, groupsize):
     import os
     from vllm.distributed import get_tensor_model_parallel_rank
-    tp_rank = get_tensor_model_parallel_rank()
-    reorder_path = f"{model_id}-reorder"
-    if not os.path.exists(reorder_path) and tp_rank == 0:
-        logger.warning(f"Start weight reorder process...")
-        if quantize == "gptq":
+    if quantize in ["gptq", 'awq']:
+        tp_rank = get_tensor_model_parallel_rank()
+        reorder_path = f"{model_id}-reorder"
+        if not os.path.exists(reorder_path) and tp_rank == 0:
+            logger.warning(f"Start weight reorder process...")
             copy_files(model_id, reorder_path, ".safetensors")
             for filename in os.listdir(model_id):
                 if filename.endswith(".safetensors"):
@@ -153,6 +153,8 @@ def weight_reorder(model_id, quantize, dtype, groupsize):
                         dtype
                     )
         logger.warning(f"Weight reorder success.")
-    return reorder_path
+        return reorder_path
+    else:
+        return None
 
 

@@ -37,6 +37,10 @@ from vllm.model_executor.layers.linear import (LinearBase,
                                                QKVParallelLinear,
                                                ReplicatedLinear,
                                                RowParallelLinear)
+from vllm.model_executor.layers.soph_linear import (SophQKVParallelLinear,
+                                                    SophRowParallelLinear,
+                                                    SophReplicatedLinear,
+                                                    SophColumnParallelLinear)
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase)
 from vllm.model_executor.model_loader.tensorizer import (
@@ -176,6 +180,14 @@ def _process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading
             module.process_weights_after_loading(model_config.dtype)
+
+    if  current_platform.is_sophtpu():
+        for name, module in model.named_modules():
+            if isinstance(module, (SophRowParallelLinear, SophColumnParallelLinear, SophReplicatedLinear)):
+                # For all model weights used on SophTPU, perform type checking and conversion. 
+                # Transpose and make contiguous the weights of down_proj in mlp. 
+                # The data types of embedding and norm are BF16, so they will not be modified for now.
+                module.process_weights_after_loading(name)
 
 
 class BaseModelLoader(ABC):

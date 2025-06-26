@@ -40,9 +40,10 @@ class SophEmbedding(torch.nn.Module):
             padding_size
         )
 
+        self.quant_method = None
         if quant_config is not None:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
-        else:
+        if self.quant_method is None:
             self.quant_method = UnquantizedEmbeddingMethod()
 
         if params_dtype is None:

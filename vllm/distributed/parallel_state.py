@@ -181,6 +181,7 @@ class GroupCoordinator:
                 import torch_tpu
                 # device_group = torch.distributed.group.WORLD
                 options = torch_tpu.ProcessGroupSCCLOptions()
+                torch_tpu.tpu.set_chip_map(options, use_rank_table=False)
                 device_group = torch.distributed.new_group(
                     ranks, backend=torch_distributed_backend,pg_options=options,)
             else:
@@ -204,7 +205,9 @@ class GroupCoordinator:
         if current_platform.is_cuda_alike():
             self.device = torch.device(f"cuda:{local_rank}")
         elif current_platform.is_sophtpu():
-            self.device = torch.device(f"tpu:{local_rank}")
+            options = torch_tpu.ProcessGroupSCCLOptions()
+            torch_tpu.tpu.set_chip_map(options, use_rank_table=False)
+            self.device = torch.device(f"tpu:{options.chip_map[local_rank]}")
         else:
             self.device = torch.device("cpu")
 
@@ -829,8 +832,13 @@ def init_distributed_environment(
         if current_platform.is_sophtpu():
 
             import os
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(world_size)
+            os.environ["LOCAL_RANK"] = str(rank)
+            os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
             os.environ["OMPI_COMM_WORLD_RANK"] = str(rank)
             os.environ["OMPI_COMM_WORLD_SIZE"] = str(world_size)
+
             # logger.info("Initializing SCCL backend...")
 
             def set_rank_affinity():

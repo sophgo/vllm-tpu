@@ -519,7 +519,7 @@ class SophTPUModelRunner:
         block_tables_tensor = torch.tensor(padded_block_tables, dtype=torch.int32, device=self.device)
 
         attn_metadata = SophTPUMetadata(
-            num_prefills=0,
+            num_prefills=None,
             num_prefill_tokens=0,
             num_decode_tokens=len(req_ids),
             slot_mapping=slot_mapping,
@@ -808,7 +808,7 @@ class SophTPUModelRunner:
         for layer_name, layer_spec in kv_cache_config.kv_cache_spec.items():
             tensor_config = kv_cache_config.tensors[layer_name]
             assert tensor_config.size % layer_spec.page_size_bytes == 0
-            num_blocks = tensor_config.size // layer_spec.page_size_bytes
+            num_blocks = tensor_config.size // layer_spec.page_size_bytes // 100
             if isinstance(layer_spec, FullAttentionSpec):
                 kv_cache_shape = SophTPUAttentionBackend.get_kv_cache_shape(
                     num_blocks, layer_spec.block_size, layer_spec.num_kv_heads,

@@ -30,6 +30,7 @@ import torch.nn as nn
 from transformers import PretrainedConfig
 
 from vllm.model_executor.custom_op import CustomOp
+from vllm.platforms import current_platform
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -693,9 +694,14 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
                          is_neox_style, dtype)
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
-        pos_freqs = self.base**(torch.arange(
-            0, self.rotary_dim, 2, dtype=torch.float, device="cuda") /
-                                self.rotary_dim)
+        if current_platform.is_sophtpu():
+            pos_freqs = self.base**(torch.arange(
+                0, self.rotary_dim, 2, dtype=torch.float) /
+                                    self.rotary_dim)
+        else:
+            pos_freqs = self.base**(torch.arange(
+                0, self.rotary_dim, 2, dtype=torch.float, device="cuda") /
+                                    self.rotary_dim)
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
@@ -712,16 +718,19 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
-        t = torch.arange(self.max_position_embeddings * self.scaling_factor,
-                         device="cuda",
-                         dtype=torch.float32)
+        if current_platform.is_sophtpu():
+            t = torch.arange(self.max_position_embeddings * self.scaling_factor, dtype=torch.float32)
+        else:
+            t = torch.arange(self.max_position_embeddings * self.scaling_factor,
+                            device="cuda",
+                            dtype=torch.float32)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
         cos = (freqs.cos() * self.mscale)
         sin = (freqs.sin() * self.mscale)
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
-    def forward(
+    def forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -760,6 +769,28 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             query = query_rot
             key = key_rot
         return query, key
+    
+    def forward_sophtpu(
+        self,
+        positions: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        self.cos_sin_cache: torch.Tensor = self.cos_sin_cache.to(
+            positions.device)
+        cos_sin = self.cos_sin_cache[torch.add(positions, offsets)
+                                     if offsets is not None else positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        # if self.is_neox_style:
+        #     # NOTE(woosuk): Here we assume that the positions tensor has the
+        #     # shape [batch_size, seq_len].
+        #     cos = cos.repeat(1, 1, 2).unsqueeze(-2)
+        #     sin = sin.repeat(1, 1, 2).unsqueeze(-2)
+        # else:
+        #     cos = cos.repeat_interleave(2, dim=-1).unsqueeze(-2)
+        #     sin = sin.repeat_interleave(2, dim=-1).unsqueeze(-2)
+
+        return cos, sin
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):

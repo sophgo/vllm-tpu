@@ -27,7 +27,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--model",
     type=str,
-    default="qwen2-7b",
+    default="deepseek_v3",
     # required=True,
     choices=["llama2-7b", "llama3.1-8b", "qwen2.5-32b", "qwen2.5-14b", "qwen2.5-7b","qwen2-7b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b",
              "qwq", "deepseek_v2", "deepseek_v3"],
@@ -41,10 +41,10 @@ parser.add_argument(
     help="Quantization method (e.g., gptq, awq)",
 )
 parser.add_argument("--batch", type=int, default=1, help="Batch size for testing")
-parser.add_argument("--path", type=str, default="/workspace/data/data/", help="Path to model dir")
+parser.add_argument("--path", type=str, default="/data/", help="Path to model dir")
 parser.add_argument("--mode", type=str, default="chat", choices=["chat", "generation"], help="Run with chat mode or generation mode")
 parser.add_argument("--useV1", type=bool, default=True, help="Use vLLM V1. Set False to use V0.")
-parser.add_argument("--tp_size", type=int, default=2, help="Tensor Parallel size. Set to 1 to disable tensor parallel.")
+parser.add_argument("--tp_size", type=int, default=8, help="Tensor Parallel size. Set to 1 to disable tensor parallel.")
 args = parser.parse_args()
 
 RANK = int(os.environ.get("OMPI_COMM_WORLD_RANK", "0"))

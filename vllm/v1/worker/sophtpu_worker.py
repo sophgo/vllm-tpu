@@ -9,6 +9,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.distributed import (init_distributed_environment, ensure_model_parallel_initialized,
+                              get_tensor_model_parallel_world_size,
                               init_world_group, GroupCoordinator)
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
@@ -62,7 +63,6 @@ class SophTPUWorker:
             init_cached_hf_modules()
 
     def init_device(self):
-        os.environ["PJRT_DEVICE"] = "SophTPU"
         torch.set_grad_enabled(False)
         torch.set_default_dtype(self.model_config.dtype)
 
@@ -74,7 +74,10 @@ class SophTPUWorker:
 
         # Device initialization should happen after initializing
         # the distributed runtime.
-        self.device = torch.device(f"tpu:{self.local_rank}")
+        import torch_tpu
+        options = torch_tpu.ProcessGroupSCCLOptions()
+        torch_tpu.tpu.set_chip_map(options, use_rank_table=False)
+        self.device = torch.device(f"tpu:{options.chip_map[self.local_rank]}")
         self.device_config.device = self.device
 
         # Set random seed.
@@ -91,14 +94,27 @@ class SophTPUWorker:
 
     def determine_available_memory(self) -> int:
         '''
-        Within the range of GPU memory utilization, 
-        determine the available memory excluding that used by model operation; 
-        subsequent updates should be implemented as soon as possible, 
-        and the maximum number of generated TOKENs 
-        and block size can also be used for calculation. 
+
         Unit: bytes        
         '''
-        return 15769803770
+        tp_size = get_tensor_model_parallel_world_size()
+
+        from vllm.platforms import soph_config
+        DECODE_TOKEN_LEN = soph_config.DECODE_TOKEN_LEN
+        request_len_max = 128
+        total_tokens_max = DECODE_TOKEN_LEN + request_len_max
+
+        batch_size_max = 128
+        
+        num_hidden_layers = self.model_config.hf_text_config.num_hidden_layers
+        num_heads = self.model_config.hf_text_config.num_key_value_heads // tp_size
+        head_dim = self.model_config.get_head_size()
+
+        bytes_per_elem = torch.tensor([], dtype=self.cache_dtype).element_size()
+
+        kvcache_memory = batch_size_max * num_hidden_layers * total_tokens_max *  num_heads * head_dim * bytes_per_elem * 2
+        kvcache_memory = kvcache_memory * 1.1  # Redundant memory
+        return kvcache_memory
 
     def execute_model(
         self,

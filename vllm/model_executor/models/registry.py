@@ -48,7 +48,7 @@ _TEXT_GENERATION_MODELS = {
     # "DeepseekV2ForCausalLM": ("deepseek_v2", "DeepseekV2ForCausalLM"),
     # "DeepseekV3ForCausalLM": ("deepseek_v2", "DeepseekV3ForCausalLM"),
     "DeepseekV2ForCausalLM": ("soph_deepseek_v2", "DeepseekV2ForCausalLM"),
-    "DeepseekV3ForCausalLM": ("soph_deepseek_v2", "DeepseekV3ForCausalLM"),
+    "DeepseekV3ForCausalLM": ("soph_deepseek_v3", "DeepseekV3ForCausalLM"),
     "ExaoneForCausalLM": ("exaone", "ExaoneForCausalLM"),
     "FalconForCausalLM": ("falcon", "FalconForCausalLM"),
     "Fairseq2LlamaForCausalLM": ("fairseq2_llama", "Fairseq2LlamaForCausalLM"),
