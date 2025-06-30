@@ -6,22 +6,20 @@ ENV CCACHE_DIR=/root/.cache/ccache
 ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
 ENV DEBIAN_FRONTEND=noninteractive
 
-ARG PYTHON_VERSION=3.11
+# Install development tools and dependencies
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl pandoc ca-certificates vim \
+    && apt-get auto-remove \
+    && rm -rf /var/lib/apt/lists/*
 
-# Install Python and other dependencies
-RUN apt-get update -y \
-    && apt-get install -y ccache software-properties-common git curl sudo \
-    && add-apt-repository ppa:deadsnakes/ppa \
-    && apt-get update -y \
-    && apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
-    && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
-    && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
-    && curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} \
-    && python3 --version && python3 -m pip --version
-# Install uv for faster pip installs
-RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install uv
+# Python related
+ENV VIRTUAL_ENV=/usr/src/.venv/ \
+    PATH=$PATH:/usr/src/.venv/bin/:/root/.local/bin/ \
+    LD_LIBRARY_PATH=/root/.local/share/uv/python/cpython-3.11.11-linux-x86_64-gnu/lib/
+
+# Script to install uv & create python venv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && uv python install 3.11 \
+    && uv venv /usr/src/.venv
 
 RUN --mount=type=cache,target=/var/cache/apt \
     apt-get update -y \
