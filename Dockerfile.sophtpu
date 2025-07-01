@@ -6,36 +6,38 @@ ENV CCACHE_DIR=/root/.cache/ccache
 ENV CMAKE_CXX_COMPILER_LAUNCHER=ccache
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install development tools and dependencies
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl pandoc ca-certificates vim \
-    && apt-get auto-remove \
-    && rm -rf /var/lib/apt/lists/*
+ARG PYTHON_VERSION=3.11
 
-# Python related
-ENV VIRTUAL_ENV=/usr/src/.venv/ \
-    PATH=$PATH:/usr/src/.venv/bin/:/root/.local/bin/ \
-    LD_LIBRARY_PATH=/root/.local/share/uv/python/cpython-3.11.11-linux-x86_64-gnu/lib/
-
-# Script to install uv & create python venv
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-    && uv python install 3.11 \
-    && uv venv /usr/src/.venv
+# Install Python and other dependencies
+RUN apt-get update -y \
+    && apt-get install -y ccache software-properties-common git curl sudo \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update -y \
+    && apt-get install -y python${PYTHON_VERSION} python${PYTHON_VERSION}-dev python${PYTHON_VERSION}-venv \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
+    && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
+    && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} \
+    && python3 --version && python3 -m pip --version
 
 RUN apt-get update -y \
-    && apt-get install -y wget numactl gcc-12 g++-12 libtcmalloc-minimal4 libnuma-dev \
+    && apt-get install -y vim pandoc wget numactl gcc-12 g++-12 libtcmalloc-minimal4 libnuma-dev \
     && apt-get install -y ffmpeg libsm6 libxext6 libgl1 \
     && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 --slave /usr/bin/g++ g++ /usr/bin/g++-12 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /workspace/vllm
+WORKDIR /workspace
 
 COPY requirements-common.txt requirements-common.txt
 COPY requirements-sophtpu.txt requirements-sophtpu.txt
-RUN uv pip install --system -r requirements-sophtpu.txt \
-    && uv pip install --system setuptools_scm \
-    && uv pip install --system torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu --force-reinstall
+RUN pip install -r requirements-sophtpu.txt \
+    && pip install setuptools_scm \
+    && pip install torch==2.1.0 --index-url https://download.pytorch.org/whl/cpu --force-reinstall \
+    && rm requirements-*.txt
 
-COPY . .
+
+COPY vllm /workspace/vllm
+COPY tests/models/decoder_only/language/test_whole_model.py /workspace
 #RUN --mount=type=cache,target=/root/.cache/pip \
 #    --mount=type=cache,target=/root/.cache/ccache \
 #    --mount=type=bind,source=.git,target=.git \
