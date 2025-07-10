@@ -30,9 +30,9 @@ parser.add_argument(
     type=str,
     default="qwen2-7b",
     # required=True,
-    choices=["llama2-7b", "llama3.1-8b", "qwen2.5-32b", "qwen2.5-14b", "qwen2.5-7b","qwen2-7b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b",
+    choices=["llama2-7b", "llama3.1-8b", "llama3.1-70b", "qwen2.5-32b", "qwen2.5-14b", "qwen2.5-7b","qwen2-7b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwen3-8b",
              "qwq", "deepseek_v2", "deepseek_v3"],
-    help="Model name to test (e.g., llama2-7b, llama3.1-8b, qwen2.5-32b, qwen2.5-14b, qwen2-7b, qwen2-57b-a14b, qwen3-32b, qwq, deepseek_v2, deepseek_v3)",
+    help="Model name to test (e.g., llama2-7b, llama3.1-8b, llama3.1-70b, qwen2.5-32b, qwen2.5-14b, qwen2-7b, qwen2-57b-a14b, qwen3-32b, qwq, qwen3-8b, deepseek_v2, deepseek_v3)",
 )
 parser.add_argument(
     "--quantize",
@@ -41,11 +41,11 @@ parser.add_argument(
     choices=["gptq", "awq"],
     help="Quantization method (e.g., gptq, awq)",
 )
-parser.add_argument("--batch", type=int, default=16, help="Batch size for testing")
-parser.add_argument("--path", type=str, default="/workspace/data/data/", help="Path to model dir")
+parser.add_argument("--batch", type=int, default=1, help="Batch size for testing")
+parser.add_argument("--path", type=str, default="/data/", help="Path to model dir")
 parser.add_argument("--mode", type=str, default="chat", choices=["chat", "generation"], help="Run with chat mode or generation mode")
 parser.add_argument("--useV1", type=bool, default=True, help="Use vLLM V1. Set False to use V0.")
-parser.add_argument("--tp_size", type=int, default=2, help="Tensor Parallel size. Set to 1 to disable tensor parallel.")
+parser.add_argument("--tp_size", type=int, default=1, help="Tensor Parallel size. Set to 1 to disable tensor parallel.")
 args = parser.parse_args()
 
 RANK = int(os.environ.get("OMPI_COMM_WORLD_RANK", "0"))
@@ -72,6 +72,10 @@ def default_llm_engine(model, quantize, path, use_v1, tp_size, batches):
             "gptq": {"model_id": "Meta-Llama-3.1-8B-Instruct-GPTQ-INT4", "dtype": "float16"},
             "default": {"model_id": "Meta-Llama-3.1-8B-Instruct", "dtype": "float16"},
         },
+        "llama3.1-70b": {
+            "gptq": {"model_id": "Meta-Llama-3-70B-Instruct-GPTQ-INT4", "dtype": "float16"},
+            "default": {"model_id": "Llama-3.1-70B-Instruct", "dtype": "float16"},
+        },
         "qwen2.5-32b": {
             "gptq": {"model_id": "Qwen2.5-32B-Instruct-GPTQ-Int4", "dtype": "float16"},
             "default": {"model_id": "Qwen2.5-32B-Instruct", "dtype": "bfloat16"}
@@ -91,6 +95,10 @@ def default_llm_engine(model, quantize, path, use_v1, tp_size, batches):
         "qwen3-4b": {
             "gptq": {"model_id": "Qwen3-4B-GPTQ-Int4","dtype": "bfloat16"},
             "default": {"model_id": "Qwen3-4B", "dtype": "bfloat16"}
+        },
+        "qwen3-8b": {
+            "gptq": {"model_id": "Qwen3-8B","dtype": "float16"},
+            "default": {"model_id": "Qwen3-8B", "dtype": "bfloat16"}
         },
         "qwen3-32b": {
             "gptq": {"model_id": "Qwen3-32B-GPTQ-Int4","dtype": "bfloat16"},
@@ -187,8 +195,8 @@ def deepseek_chat_wrapper(question):
     return res
 
 # group model by model structure
-llama_models = ["llama2-7b", "llama3.1-8b"]
-qwen_models = ["qwen2.5-32b", "qwen2.5-14b", "qwen2-7b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwq"]
+llama_models = ["llama2-7b", "llama3.1-8b", "llama3.1-70b"]
+qwen_models = ["qwen2.5-32b", "qwen2.5-14b", "qwen2-7b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwq", "qwen3-8b"]
 deepseek_models = ["deepseek_v2", "deepseek_v3"]
 # decide the chat wrapper by model type
 CHAT_WRAPPER = {model: llama_chat_wrapper for model in llama_models}
