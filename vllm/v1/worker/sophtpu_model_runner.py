@@ -69,6 +69,19 @@ class DecodeData:
     attn_metadata: Optional[SophTPUMetadata] = None
 
 
+#vllm's FullAttentionSpec has bug, and fixed in latest version
+#just implement here right now, can use vllm's AttentionSpec after
+@dataclass
+class SophAttentionSpec(FullAttentionSpec):
+    use_mla: bool
+
+    @property
+    def page_size_bytes(self) -> int:
+        coef = 1 if self.use_mla else 2
+        return  coef * self.block_size * self.num_kv_heads * self.head_size \
+                * get_dtype_size(self.dtype)
+
+
 class SophTPUModelRunner:
 
     def __init__(
@@ -332,11 +345,12 @@ class SophTPUModelRunner:
             # cross-attention, MLA.
             assert isinstance(attn_module, Attention)
             if attn_module.attn_type == AttentionType.DECODER:
-                kv_cache_spec[layer_name] = FullAttentionSpec(
+                kv_cache_spec[layer_name] = SophAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=attn_module.num_kv_heads,
                     head_size=attn_module.head_size,
                     dtype=attn_module.dtype,
+                    use_mls=self.vllm_config.model_config.use_mla,
                 )
             elif attn_module.attn_type in (AttentionType.ENCODER,
                                            AttentionType.ENCODER_ONLY):
@@ -801,18 +815,31 @@ class SophTPUModelRunner:
             tensor_config = kv_cache_config.tensors[layer_name]
             assert tensor_config.size % layer_spec.page_size_bytes == 0
             num_blocks = tensor_config.size // layer_spec.page_size_bytes // 100
-            if isinstance(layer_spec, FullAttentionSpec):
+            if isinstance(layer_spec, SophAttentionSpec):
                 kv_cache_shape = SophTPUAttentionBackend.get_kv_cache_shape(
                     num_blocks, layer_spec.block_size, layer_spec.num_kv_heads,
                     layer_spec.head_size)
                 dtype = layer_spec.dtype
 
-                tpu_k_cache = torch.empty(kv_cache_shape,
-                                          dtype=dtype,
-                                          device=self.device)
-                tpu_v_cache = torch.empty_like(tpu_k_cache)
+                if self.model_config.is_deepseek_mla:
+                    assert self.model_config.use_mla
+                    qk_rope_head_dim = getattr(self.model_config.hf_text_config, "qk_rope_head_dim", 0)
+                    kv_lora_rank = self.model_config.hf_text_config.kv_lora_rank
+                    tpu_kv_cache = torch.empty((kv_cache_shape[0], kv_cache_shape[1], kv_lora_rank),
+                                               dtype=dtype,
+                                               device=self.device)
+                    tpu_pe_cache = torch.empty((kv_cache_shape[0], kv_cache_shape[1], qk_rope_head_dim),
+                                               dtype=dtype,
+                                               device=self.device)
 
-                kv_caches[layer_name] = (tpu_k_cache, tpu_v_cache)
+                    kv_caches[layer_name] = (tpu_kv_cache, tpu_pe_cache)
+                else:
+                    tpu_k_cache = torch.empty(kv_cache_shape,
+                                              dtype=dtype,
+                                              device=self.device)
+                    tpu_v_cache = torch.empty_like(tpu_k_cache)
+
+                    kv_caches[layer_name] = (tpu_k_cache, tpu_v_cache)
             else:
                 raise NotImplementedError
 

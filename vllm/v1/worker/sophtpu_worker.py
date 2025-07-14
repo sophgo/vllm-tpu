@@ -95,24 +95,22 @@ class SophTPUWorker:
     def determine_available_memory(self) -> int:
         '''
 
-        Unit: bytes        
+        Unit: bytes
         '''
         tp_size = get_tensor_model_parallel_world_size()
 
-        from vllm.platforms import soph_config
-        DECODE_TOKEN_LEN = soph_config.DECODE_TOKEN_LEN
-        request_len_max = 128
-        total_tokens_max = DECODE_TOKEN_LEN + request_len_max
+        total_tokens_max = self.model_config.max_model_len
 
         batch_size_max = 128
-        
+
         num_hidden_layers = self.model_config.hf_text_config.num_hidden_layers
-        num_heads = self.model_config.hf_text_config.num_key_value_heads // tp_size
+        num_heads = self.model_config.get_num_kv_heads(self.parallel_config)
         head_dim = self.model_config.get_head_size()
 
         bytes_per_elem = torch.tensor([], dtype=self.cache_dtype).element_size()
 
-        kvcache_memory = batch_size_max * num_hidden_layers * total_tokens_max *  num_heads * head_dim * bytes_per_elem * 2
+        coef = 1 if self.model_config.use_mla else 2
+        kvcache_memory = coef * batch_size_max * num_hidden_layers * total_tokens_max * num_heads * head_dim * bytes_per_elem
         kvcache_memory = kvcache_memory * 1.1  # Redundant memory
         return kvcache_memory
 

@@ -22,6 +22,7 @@ from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
+from vllm.distributed import get_tensor_model_parallel_rank
 
 import torch
 from torch import nn
@@ -39,10 +40,12 @@ from vllm.distributed import (get_pp_group,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.soph_fused_moe import SophDeepseekV3FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.soph_linear import (SophColumnParallelLinear,
                                                     SophReplicatedLinear,
-                                                    SophRowParallelLinear)
+                                                    SophRowParallelLinear,
+                                                    soph_to_dtype)
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                MergedColumnParallelLinear,
                                                ReplicatedLinear,
@@ -55,6 +58,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.layers.soph_embedding import SophEmbedding
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
@@ -63,8 +67,34 @@ from .utils import (PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
+# def print_tensor_info(name, param):
+#     print(f"  - {name}:", end=" ")
 
-# Copied from transformers.models.llama.modeling_llama.rotate_half
+#     if torch.is_tensor(param):
+#         print(f"shape = {param.shape} | dtype = {param.dtype}", end=" ")
+#         if param.dtype != torch.bool:
+#             mean_val = param.cpu().float().mean().item()
+#             print(f"| mean = {mean_val:.6f}", end="")
+#         else:
+#             print(f"| mean = N/A (bool)", end="")
+#     else:
+#         print(f"value = {param} | type = {type(param)}", end="")
+#     print()
+
+# class Timer:
+#     def __init__(self, name):
+#         self.start(name)
+
+#     def start(self, name):
+#         self.name = name
+#         torch_tpu.tpu.synchronize()
+#         self.start_time = time.time_ns()
+
+#     def end(self):
+#         torch_tpu.tpu.synchronize()
+#         end_time = time.time_ns()
+#         latency = (end_time - self.start_time) // 1e3
+#         logger.info(f'Time {self.name} {latency}us')
 
 def soph_rmsnorm(weight, output, hidden_states, variance_epsilon, residual=None):
     if residual is not None:
@@ -80,6 +110,7 @@ def soph_rmsnorm(weight, output, hidden_states, variance_epsilon, residual=None)
     )
     return residual
 
+# Copied from transformers.models.llama.modeling_llama.rotate_half
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -97,21 +128,6 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
-
-# class Timer:
-#     def __init__(self, name):
-#         self.start(name)
-
-#     def start(self, name):
-#         self.name = name
-#         torch_tpu.tpu.synchronize()
-#         self.start_time = time.time_ns()
-
-#     def end(self):
-#         torch_tpu.tpu.synchronize()
-#         end_time = time.time_ns()
-#         latency = (end_time - self.start_time) // 1e3
-#         logger.info(f'Time {self.name} {latency}us')
 
 class DeepseekV3Config(PretrainedConfig):
     def __init__(
@@ -254,8 +270,8 @@ class DeepseekV3Attention(torch.nn.Module):
                 f"and `num_shards`: {self.tp_size}"
             )
 
-        self.num_heads = self.num_heads
-        self.num_key_value_heads = config.num_key_value_heads
+        self.num_heads = self.num_heads // self.tp_size
+        self.num_key_value_heads = config.num_key_value_heads // self.tp_size
 
         self.weight_block_size = 128
         if self.q_lora_rank is None:
@@ -271,7 +287,6 @@ class DeepseekV3Attention(torch.nn.Module):
                                              bias=False,
                                              quant_config=quant_config,
                                              prefix=f"{prefix}.q_a_proj")
-            self.q_a_proj_weight = (self.q_a_proj.weight.data, self.q_a_proj.weight_scale_inv.data)
 
             self.q_a_layernorm = RMSNorm(self.q_lora_rank,
                                          eps=config.rms_norm_eps)
@@ -284,8 +299,6 @@ class DeepseekV3Attention(torch.nn.Module):
                                                  quant_config=quant_config,
                                                  prefix=f"{prefix}.q_b_proj")
 
-        # self.kv_scales = get_kv_scales(weights, f"{prefix}")
-
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank,
                                       eps=config.rms_norm_eps)
 
@@ -296,7 +309,6 @@ class DeepseekV3Attention(torch.nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.kv_a_proj_with_mqa")
-        self.kv_a_weight_with_mqa = (self.kv_a_proj_with_mqa.weight.data, self.kv_a_proj_with_mqa.weight_scale_inv.data)
         # load kv-b fp8 weights and f16 scales, with parallel
         self.kv_b_proj = SophColumnParallelLinear(
             self.kv_lora_rank,
@@ -310,7 +322,7 @@ class DeepseekV3Attention(torch.nn.Module):
                                         bias=False,
                                         quant_config=quant_config,
                                         prefix=f"{prefix}.o_proj")
-        self.o_proj_weight = (self.o_proj.weight.data, self.o_proj.weight_scale_inv.data)
+
         self.num_groups = self.num_heads // self.num_key_value_heads
         # self.quantized = quant_config
 
@@ -325,9 +337,9 @@ class DeepseekV3Attention(torch.nn.Module):
         self.eps=config.rms_norm_eps
 
         self.attn = Attention(self.num_heads,
-                              self.head_size,
+                              self.kv_lora_rank + self.qk_rope_head_dim,
                               self.softmax_scale,
-                              num_kv_heads=self.num_key_value_heads,
+                              num_kv_heads=1,
                               cache_config=cache_config,
                               quant_config=quant_config,
                               prefix=f"{prefix}.attn",
@@ -349,6 +361,9 @@ class DeepseekV3Attention(torch.nn.Module):
     ):
         self.kv_b_weight = (self.kv_b_proj.weight.data, self.kv_b_proj.weight_scale_inv.data)
         self.q_b_weight = (self.q_b_proj.weight.data, self.q_b_proj.weight_scale_inv.data)
+        self.q_a_proj_weight = (self.q_a_proj.weight.data, self.q_a_proj.weight_scale_inv.data)
+        self.kv_a_weight_with_mqa = (self.kv_a_proj_with_mqa.weight.data, self.kv_a_proj_with_mqa.weight_scale_inv.data)
+        self.o_proj_weight = (self.o_proj.weight.data, self.o_proj.weight_scale_inv.data)
 
         batch = input_lengths.shape[0]
         if self.kv_cache is None and self.use_paged_kv_cache == False:
@@ -376,23 +391,22 @@ class DeepseekV3Attention(torch.nn.Module):
                 self.weight_block_size)
             soph_rmsnorm(self.q_a_layernorm.weight.data, normed_lquery, lquery, self.eps)
             query = normed_lquery
- 
+
         # kv-compress and k-pe
         torch.ops.my_ops.mm_w8a16_dq_forward(
             hidden_states,
             *self.kv_a_weight_with_mqa,
             lkv,
             self.weight_block_size)
- 
         if seqlen > 1:
             lkv_nope.copy_(lkv[:, :self.kv_lora_rank])
             key_pe.copy_(lkv[:, self.kv_lora_rank:])
         else:
             lkv_nope = lkv[0, :self.kv_lora_rank]
             key_pe = lkv[0, self.kv_lora_rank:]
- 
+
         soph_rmsnorm(self.kv_a_layernorm.weight.data, normed_lkv_nope, lkv_nope, self.eps)
- 
+
         if self.use_paged_kv_cache == False:
             torch.ops.my_ops.latent_attention_fp8(
                 attention_output["attn_out"],
@@ -439,6 +453,7 @@ class DeepseekV3Attention(torch.nn.Module):
                 mask,
                 input_lengths,
                 self.num_heads,
+                1,
                 self.q_lora_rank,
                 self.kv_lora_rank,
                 self.qk_nope_head_dim,
@@ -450,15 +465,13 @@ class DeepseekV3Attention(torch.nn.Module):
                 kv_cache[0].shape[1],
                 self.softmax_scale,
                 2 if cu_seqlen_prefill is not None else 3)
- 
-        # output proj
+
         torch.ops.my_ops.mm_w8a16_dq_forward(
             attention_output["attn_out"].reshape(-1, self.num_heads * self.value_head_size),
             self.o_proj_weight[0],
             self.o_proj_weight[1],
             attention_output["o_proj_out"],
             self.weight_block_size)
-
         if self.tp_size > 1:
             attention_output["o_proj_out"] = tensor_model_parallel_all_reduce(attention_output["o_proj_out"])
         return attention_output["o_proj_out"]
@@ -477,21 +490,21 @@ class DeepseekV3MLP(nn.Module):
     ) -> None:
         super().__init__()
         self.quant_config = quant_config
-        self.gate_proj = ColumnParallelLinear(
+        self.gate_proj = SophColumnParallelLinear(
             hidden_size,
             intermediate_size,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.gate_proj",
         )
-        self.up_proj = ColumnParallelLinear(
+        self.up_proj = SophColumnParallelLinear(
             hidden_size,
             intermediate_size,
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.up_proj",
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = SophRowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
@@ -499,20 +512,16 @@ class DeepseekV3MLP(nn.Module):
             prefix=f"{prefix}.down_proj",
         )
 
-        self.up_weight = self.up_proj.weight.data
-        self.up_scale = self.up_proj.weight_scale_inv.data
-        self.gate_weight = self.gate_proj.weight.data
-        self.gate_scale = self.gate_proj.weight_scale_inv.data
-        self.down_proj_weight = self.down_proj.weight.data
-        down_proj_dtype = self.down_proj_weight.dtype
-        self.down_weight = self.down_proj_weight.to('cpu').transpose(0,1).contiguous()
-        self.down_weight = self.down_weight.to(self.down_proj_weight.device)
-        self.down_scale = self.down_proj.weight_scale_inv.data.transpose(0,1).contiguous()
-
         self.blocksize = self.quant_config.weight_block_size[0]
         self.tp_size = get_tensor_model_parallel_world_size()
 
     def forward(self, x, output, *args):
+        self.up_weight = self.up_proj.weight.data
+        self.up_scale = self.up_proj.weight_scale_inv.data
+        self.gate_weight = self.gate_proj.weight.data
+        self.gate_scale = self.gate_proj.weight_scale_inv.data
+        self.down_weight = self.down_proj.weight.data
+        self.down_scale = self.down_proj.weight_scale_inv.data
         torch.ops.my_ops.mlp_w8a16_dq_forward(x, self.gate_weight, self.up_weight, self.down_weight,
                                                 self.gate_scale, self.up_scale, self.down_scale,
                                                 output, self.blocksize)
@@ -532,68 +541,28 @@ class DeepseekV3MoE(nn.Module):
         self.n_routed_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
-
         self.scoring_func = config.scoring_func
         self.n_group = config.n_group
         self.topk_group = config.topk_group
         self.topk_method = config.topk_method
         self.routed_scaling_factor = config.routed_scaling_factor
+        self.max_seq_len = 0
 
         # Gating
         self.gate = SophReplicatedLinear(config.hidden_size,
                                 config.n_routed_experts,
                                 bias=False,
-                                quant_config=quant_config,
+                                quant_config=None,
                                 prefix=f"{prefix}.gate")
-
-        # Routed experts
-        gate_weights = []
-        gate_scales = []
-        up_weights = []
-        up_scales = []
-        down_weights = []
-        down_scales = []
-
-        self.experts = nn.ModuleList([
-            DeepseekV3MLP(
+        # experts
+        self.experts = SophDeepseekV3FusedMoE(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.moe_intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
-                prefix=f"{prefix}.experts.{idx}", 
-            )
-            for idx in range(self.n_routed_experts)
-        ])
-
-        for expert in self.experts:
-            up_weights.append(expert.up_weight)
-            up_scales.append(expert.up_scale)
-
-            gate_weights.append(expert.gate_weight)
-            gate_scales.append(expert.gate_scale)
-
-            down_proj_dtype = expert.down_weight.dtype
-            down_weights.append(expert.down_weight)
-            down_scales.append(expert.down_scale)
-
-        def concat(tensors):
-            origDtype = tensors[0].dtype
-            origShape = tensors[0].shape
-            origDevice = tensors[0].device
-            acc = torch.empty(len(tensors), *origShape, dtype=origDtype, device=origDevice)
-            for idx, t in enumerate(tensors):
-                acc[idx] = t
-            tensors.clear()
-            return acc
-
-        self.gate_weights = concat(gate_weights)
-        self.gate_scales = concat(gate_scales)
-        self.up_weights = concat(up_weights)
-        self.up_scales = concat(up_scales)
-        self.down_weights = concat(down_weights)
-        self.down_scales = concat(down_scales)
-        self.down_weights = self.down_weights.contiguous()
-        self.down_scales = self.down_scales.contiguous()
+                n_routed_experts = self.n_routed_experts,
+                prefix=f"{prefix}.experts",
+                )
 
         # shared experts
         if config.n_shared_experts is not None:
@@ -609,14 +578,10 @@ class DeepseekV3MoE(nn.Module):
         else:
             self.shared_experts = None
 
-        self.max_seq_len = 0
-        
-
     def update_buffer(self, seqlen, device):
         if seqlen <= self.max_seq_len:
             return
         self.max_seq_len = seqlen
-
         opts = dict(device=device, dtype=torch.bfloat16)
         self.router_logits = torch.empty(self.max_seq_len, self.n_routed_experts, **opts)
         self.routing_weights = torch.empty(self.max_seq_len, self.top_k, **opts)
@@ -663,29 +628,27 @@ class DeepseekV3MoE(nn.Module):
         selected_experts_middle = None
         routing_weights_middle = None
         num_select_experts = None
- 
+
         block_size = 128
         num_experts = self.n_routed_experts
         num_experts_per_tok = self.top_k
         use_grouped_topk = True
         num_expert_group = self.n_group
         topk_group = self.topk_group
-        torch.ops.my_ops.fused_moe_fused_experts(gathered_experts_out_buf, x,
-                                                output_sample, input_sample,
-                                                self.gate_weights, self.up_weights, self.down_weights,
-                                                self.gate_scales, self.up_scales, self.down_scales,
-                                                selected_experts, routing_weights,
-                                                num_select_experts,
-                                                selected_experts_middle, routing_weights_middle,
-                                                block_size, num_experts, num_experts_per_tok,
-                                                use_grouped_topk, num_expert_group, topk_group,
-                                                None, None, None, False)
- 
+
+        self.experts(gathered_experts_out_buf, x,
+                    output_sample, input_sample,
+                    selected_experts, routing_weights,
+                    num_select_experts,
+                    selected_experts_middle, routing_weights_middle,
+                    block_size, num_experts, num_experts_per_tok,
+                    use_grouped_topk, num_expert_group, topk_group,)
+
         if self.norm_topk_prob:
             torch.sum(routing_weights, dim=-1, keepdim=True, out=denominator) # + 1e-20
             torch.mul(routing_weights, self.routed_scaling_factor, out=routing_weights)
             torch.div(routing_weights, denominator, out=routing_weights)
- 
+
         torch.bmm(gathered_experts_out_buf.transpose(-2, -1), routing_weights.unsqueeze(2), out=out.unsqueeze(2))
         if shared_output is not None:
             out += shared_output
@@ -712,10 +675,6 @@ class DeepseekV3DecoderLayer(nn.Module):
         # DecoderLayers are created with `make_layers` which passes the prefix
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
-        # if model_config.use_mla:
-        #     attn_cls = DeepseekV2MLAAttention
-        # else:
-        #     attn_cls = DeepseekV2Attention
         self.self_attn = DeepseekV3Attention(
             prefix=f"{prefix}.self_attn",
             config=config,
@@ -783,17 +742,14 @@ class DeepseekV3DecoderLayer(nn.Module):
             attn_buffer
         )
         attn_res = soph_rmsnorm(self.post_attention_layernorm.weight, rms_buffer, attn_output, self.eps, res)
-
         mlp_output = self.mlp(
             rms_buffer, mlp_buffer,
             gathered_experts_out_buf,
             shared_expert_out_buf,
             default_device,
             default_dtype)
-        
         if self.tp_size > 1:
             mlp_output = tensor_model_parallel_all_reduce(mlp_output)
-
         return mlp_output, attn_res
 
 class SophTensorEmbedding(nn.Module):
@@ -803,7 +759,6 @@ class SophTensorEmbedding(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         out = torch.nn.functional.embedding(input, self.weight)
-
         return out
 
 class DeepseekV3Model(torch.nn.Module):
@@ -821,11 +776,6 @@ class DeepseekV3Model(torch.nn.Module):
         self.vocab_size = config.vocab_size
 
         if get_pp_group().is_first_rank:
-            # self.embed_tokens = VocabParallelEmbedding(
-            #     config.vocab_size,
-            #     config.hidden_size,
-            #     quant_config=quant_config,
-            #     prefix=f"{prefix}.embed_tokens")
             self.embed_tokens = SophEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -878,8 +828,8 @@ class DeepseekV3Model(torch.nn.Module):
             rope_scaling = rope_scaling,
         )
 
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
+        self.num_heads = self.layers[0].self_attn.num_heads
+        self.num_kv_heads = self.layers[0].self_attn.num_key_value_heads
         self.num_experts_per_tok = config.num_experts_per_tok
         self.mlp_buffer = None
         self.attn_buffer = None
@@ -983,9 +933,7 @@ class DeepseekV3Model(torch.nn.Module):
                 "hidden_states": hidden_states,
                 "residual": residual
             })
-        #hidden_states, _ = self.norm(hidden_states, residual)
         soph_rmsnorm(self.norm.weight, rms_buffer, hidden_states, self.eps, residual)
-        #return hidden_states
         return rms_buffer
 
 
@@ -1063,24 +1011,19 @@ class DeepseekV3ForCausalLM(nn.Module, SupportsPP):
         ]
 
         # Params for weights, fp8 weight scales, fp8 activation scales
-        # (param_name, weight_name, expert_id, shard_id)
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
+        # (param_name, weight_name, expert_id)
+        expert_params_mapping = SophDeepseekV3FusedMoE.make_expert_params_mapping(
             num_experts=self.config.n_routed_experts)
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-            exclude_list = ['embed_tokens'] + [f'model.layers.{i}' for i in range(self.config.num_hidden_layers)]  # 前config.num_hidden_layer层
+            exclude_list = ['lm_head'] + ['model.norm'] + ['model.embed_tokens'] + [f'model.layers.{i}.' for i in range(self.config.num_hidden_layers)]  # 前config.num_hidden_layer层
             if all(exclude_str not in name for exclude_str in exclude_list):
                 continue
-            
+
             if "rotary_emb.inv_freq" in name:
                 continue
-
-            # print(f'name:{name};dtype:{loaded_weight.dtype}')
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
@@ -1112,21 +1055,22 @@ class DeepseekV3ForCausalLM(nn.Module, SupportsPP):
                 break
             else:
                 for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
+                    param_name, weight_name, expert_id = mapping
                     if weight_name not in name:
                         continue
-                    # name = name.replace(weight_name, param_name)
+                    if 'scale' in name and 'scale' not in weight_name:
+                        continue
+                    name = name.replace(weight_name, param_name)
 
                     if is_pp_missing_parameter(name, self):
                         continue
 
                     param = params_dict[name]
                     weight_loader = param.weight_loader
-                    weight_loader(param,
+                    weight_loader(
                                   loaded_weight,
-                                #   name,
-                                #   shard_id=shard_id,
-                                #   expert_id=expert_id
+                                  param,
+                                  expert_id=expert_id
                                   )
                     break
                 else:
