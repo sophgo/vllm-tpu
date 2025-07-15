@@ -19,8 +19,8 @@ class SophTpuPlatform(Platform):
     _enum = PlatformEnum.SOPHTPU
     device_name: str = "sophtpu"
     device_type: str = "sophtpu"
-    dispatch_key: str = "Torch-TPU"
-    ray_device_key: str = "SOPHTPU"
+    dispatch_key: str = "PrivateUse1"
+    ray_device_key: str = ""
     device_control_env_var: str = "SOPHTPU_VISIBLE_CHIPS"
 
     supported_quantization: list[str] = [
@@ -114,3 +114,14 @@ class SophTpuPlatform(Platform):
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "vllm.distributed.device_communicators.sophtpu_communicator.SophTpuCommunicator"  # noqa
+
+    @classmethod
+    def seed_everything(cls, seed: Optional[int] = None) -> None:
+        if seed is not None:
+            import random
+            import numpy as np
+            import torch_tpu
+            random.seed(seed)
+            np.random.seed(seed)
+            torch_tpu.tpu.manual_seed_all(seed)
+

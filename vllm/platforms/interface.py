@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import torch_tpu
 
 from vllm.logger import init_logger
 
@@ -230,8 +229,7 @@ class Platform:
         if seed is not None:
             random.seed(seed)
             np.random.seed(seed)
-            #torch.manual_seed(seed)
-            torch_tpu.tpu.manual_seed_all(seed)
+            torch.manual_seed(seed)
 
     @classmethod
     def pre_register_and_update(cls,

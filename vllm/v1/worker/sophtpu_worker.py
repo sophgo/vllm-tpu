@@ -149,7 +149,6 @@ class SophTPUWorker:
         # worker will always be healthy as long as it's running.
         return
 
-_WORLD: Optional[GroupCoordinator] = None
 
 def init_sophtpu_worker_distributed_environment(
     parallel_config: ParallelConfig,

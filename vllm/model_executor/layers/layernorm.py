@@ -31,10 +31,7 @@ class RMSNorm(CustomOp):
                                        else var_hidden_size)
         self.has_weight = has_weight
 
-        if current_platform.is_sophtpu:
-            self.weight = torch.empty(hidden_size, dtype = torch.bfloat16)
-        else:
-            self.weight = torch.ones(hidden_size)
+        self.weight = torch.ones(hidden_size)
         if self.has_weight:
             self.weight = nn.Parameter(self.weight)
 
