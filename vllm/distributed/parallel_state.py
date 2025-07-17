@@ -205,9 +205,7 @@ class GroupCoordinator:
         if current_platform.is_cuda_alike():
             self.device = torch.device(f"cuda:{local_rank}")
         elif current_platform.is_sophtpu():
-            options = torch_tpu.ProcessGroupSCCLOptions()
-            torch_tpu.tpu.set_chip_map(options, use_rank_table=False)
-            self.device = torch.device(f"tpu:{options.chip_map[local_rank]}")
+            self.device = torch.device(f"tpu:{local_rank}")
         else:
             self.device = torch.device("cpu")
 
@@ -852,7 +850,7 @@ def init_distributed_environment(
             import torch_tpu
             options = torch_tpu.ProcessGroupSCCLOptions()
             torch_tpu.tpu.set_chip_map(options, use_rank_table=False)
-            torch_tpu.tpu.set_device(options.chip_map[rank])
+            torch_tpu.tpu.set_device(rank)
 
             torch.distributed.init_process_group(
                 backend=backend,
