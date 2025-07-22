@@ -241,9 +241,6 @@ class Sampler(nn.Module):
         assert logits is not None
         _, vocab_size = logits.shape
 
-        #torch_tpu.tpu.synchronize()
-        #time011 = time.time_ns()
-        #print(f"Sampler time011 {time011 / 1000**2:.3f}ms")
         # Prepare sampling tensors with pinned memory to avoid blocking.
         if not sampling_metadata.reuse_sampling_tensors:
             self._init_sampling_tensors(logits, sampling_metadata)

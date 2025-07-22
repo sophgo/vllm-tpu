@@ -317,10 +317,10 @@ class SophTPUModelRunner:
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         """
-        Generates the KVCacheSpec by parsing the kv cache format from each 
+        Generates the KVCacheSpec by parsing the kv cache format from each
         Attention module in the static forward context.
         Returns:
-            KVCacheSpec: A dictionary mapping layer names to their KV cache 
+            KVCacheSpec: A dictionary mapping layer names to their KV cache
             format. Layers that do not need KV cache are not included.
         """
 
@@ -438,7 +438,7 @@ class SophTPUModelRunner:
                 slot_mapping.append(slot)
 
             # block_tables
-            req_blocks = [bid for bid in block_ids 
+            req_blocks = [bid for bid in block_ids
                         if bid >= (start_idx // self.block_size)]
             block_tables.append(req_blocks)
             max_blocks = max(max_blocks, len(req_blocks))
@@ -485,10 +485,10 @@ class SophTPUModelRunner:
             seq_len = req_state.num_tokens
             position = seq_len - 1
             seq_len = seq_len if self.sliding_window is None else min(
-                seq_len, self.sliding_window) 
+                seq_len, self.sliding_window)
             block_ids = req_state.block_ids
             start_idx = max(0, seq_len - self.sliding_window) if self.sliding_window else 0
-            
+
             # input_tokens\input_positions\context_lens
             input_tokens.append(generation_token)
             input_positions.append(position)
@@ -505,7 +505,7 @@ class SophTPUModelRunner:
             slot_mapping.append(slot)
 
             # block_tables
-            req_blocks = [bid for bid in block_ids 
+            req_blocks = [bid for bid in block_ids
                         if bid >= (start_idx // self.block_size)]
             block_tables.append(req_blocks)
             max_blocks = max(max_blocks, len(req_blocks))
@@ -558,8 +558,6 @@ class SophTPUModelRunner:
         else:
             model_input = None
 
-        torch_tpu.tpu.synchronize()
-        t1 = time.time_ns()
         with set_forward_context(model_input.attn_metadata,
                                     self.vllm_config):
             assert self.model is not None
@@ -567,23 +565,17 @@ class SophTPUModelRunner:
                                                         positions=model_input.input_positions,
                                                         kv_caches=self.kv_caches,
                                                         attn_metadata=model_input.attn_metadata,
-                                                        intermediate_tensors=intermediate_tensors,)  
-            #TODO:For mixed batches of prefill and decode, 
+                                                        intermediate_tensors=intermediate_tensors,)
+            #TODO:For mixed batches of prefill and decode,
             # the prepare_decode can be executed in parallel during the prefill inference phase.
         logits = self.model.compute_logits(hidden_or_intermediate_states, None)
-        torch_tpu.tpu.synchronize()
-        t2 = time.time_ns()
 
         # Greedy sampling.
         argmax_token_ids = torch.argmax(logits, dim=-1, keepdim=True)
         argmax_token_ids = argmax_token_ids.squeeze(dim=-1)
-        
-        torch_tpu.tpu.synchronize()
-        t3 = time.time_ns()
-        # Transfer sampled tokens from TPU to CPU. 
+
+        # Transfer sampled tokens from TPU to CPU.
         generate_token_ids_cpu = argmax_token_ids.cpu()
-        torch_tpu.tpu.synchronize()
-        t4 = time.time_ns()
 
         # self._statistics_time(t1, t2, t3, t4)
 
@@ -599,7 +591,7 @@ class SophTPUModelRunner:
             if num_prompts > 0:
                 generate_token_index_ = sum(pd_info.prompt_scheduled_tokens[:i+1])
                 token_id = generate_token_ids_list[generate_token_index_-1]
-            else: 
+            else:
                 token_id = generate_token_ids_list[i]
             sampled_token_ids[req_index] = token_id
             self.input_batch.token_ids_cpu[req_index, seq_len] = token_id
@@ -619,7 +611,7 @@ class SophTPUModelRunner:
             logprobs=None,
             prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
         )
-        
+
         return model_runner_output
 
     def load_model(self) -> None:
@@ -795,7 +787,7 @@ class SophTPUModelRunner:
         """
         Initialize KV cache based on `kv_cache_config`.
         Args:
-            kv_cache_config: Configuration for the KV cache, including the KV 
+            kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
         """
         if len(kv_cache_config.groups) > 1:
@@ -828,12 +820,12 @@ class SophTPUModelRunner:
             kv_caches,
             self.vllm_config.compilation_config.static_forward_context,
             self.kv_caches)
-        
+
     def _statistics_time(self, t1, t2, t3, t4):
         import os
         DECODE_TOKEN_LEN = int(os.getenv("DECODE_TOKEN_LEN", "128"))
         self.num_tokens += 1
-        if self.num_tokens > DECODE_TOKEN_LEN: 
+        if self.num_tokens > DECODE_TOKEN_LEN:
             self.time_records["inference"].append((t2 - t1)/1e6)
             self.time_records["data_transfer"].append((t4 - t3)/1e6)
             if self.num_tokens == int(DECODE_TOKEN_LEN * 2):

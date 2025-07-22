@@ -19,6 +19,7 @@ class SophTpuPlatform(Platform):
     _enum = PlatformEnum.SOPHTPU
     device_name: str = "sophtpu"
     device_type: str = "sophtpu"
+    simple_compile_backend: str = "eager"  # Disable torch.compile()
     dispatch_key: str = "PrivateUse1"
     ray_device_key: str = ""
     device_control_env_var: str = "SOPHTPU_VISIBLE_CHIPS"
