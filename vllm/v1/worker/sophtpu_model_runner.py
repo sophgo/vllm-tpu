@@ -373,42 +373,30 @@ class SophTPUModelRunner:
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
 
-        # Traverse decodes first
+        prompt_req_ids = []
         decode_req_ids = []
+        prompt_scheduled_tokens = []
+
         for i in range(num_reqs):
             req_id = self.input_batch.req_ids[i]
             assert req_id is not None
 
             num_computed_tokens = self.input_batch.num_computed_tokens_cpu[i]
             num_prompt_tokens = self.input_batch.num_prompt_tokens[i]
-            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[
-                req_id]
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
 
             if num_computed_tokens < num_prompt_tokens:
-                # This is prompt
-                break
+                # Prompt
+                prompt_req_ids.append(req_id)
+                prompt_scheduled_tokens.append(num_scheduled_tokens)
+            else:
+                # Decode
+                assert num_scheduled_tokens == 1, (
+                    f"Decode request {req_id} scheduled {num_scheduled_tokens} tokens")
+                decode_req_ids.append(req_id)
 
-            # This is decode
-            assert num_scheduled_tokens == 1
-            decode_req_ids.append(req_id)
-
-        # Traverse prompts
-        prompt_req_ids = []
-        prompt_scheduled_tokens = []
-        for i in range(len(decode_req_ids), num_reqs):
-            req_id = self.input_batch.req_ids[i]
-            assert req_id is not None
-
-            num_computed_tokens = self.input_batch.num_computed_tokens_cpu[i]
-            num_prompt_tokens = self.input_batch.num_prompt_tokens[i]
-            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[
-                req_id]
-
-            # Must be prompt
-            assert num_computed_tokens < num_prompt_tokens
-
-            prompt_req_ids.append(req_id)
-            prompt_scheduled_tokens.append(num_scheduled_tokens)
+        if not (prompt_req_ids or decode_req_ids):
+            raise RuntimeError("No valid prompt or decode requests identified")
 
         return PromptDecodeInfo(prompt_req_ids, decode_req_ids,
                                 prompt_scheduled_tokens)
@@ -432,7 +420,7 @@ class SophTPUModelRunner:
             block_ids = req_state.block_ids
             num_computed = req_state.num_computed_tokens
             start_idx = max(0, len(prompt_token_ids) - self.sliding_window) if self.sliding_window else 0
-            process_tokens = prompt_token_ids[num_computed:]
+            process_tokens = prompt_token_ids[num_computed:num_computed+self.max_num_tokens]
 
             # input_tokens\input_positions\prompt_lens\context_lens
             input_tokens.extend(process_tokens)
@@ -495,7 +483,15 @@ class SophTPUModelRunner:
 
         for req_id in req_ids:
             req_state = self.requests[req_id]
-            generation_token = req_state.output_token_ids[-1]
+            # generation_token = req_state.output_token_ids[-1]
+            if not req_state.output_token_ids:
+                if req_state.prompt_token_ids:
+                    generation_token = req_state.prompt_token_ids[-1]
+                else:
+                    # empty prompt，using BOS token
+                    generation_token = 1
+            else:
+                generation_token = req_state.output_token_ids[-1]
             seq_len = req_state.num_tokens
             position = seq_len - 1
             seq_len = seq_len if self.sliding_window is None else min(
@@ -555,78 +551,57 @@ class SophTPUModelRunner:
     ) -> ModelRunnerOutput:
         # Update cached state
         self._update_states(scheduler_output)
-
         pd_info = self._get_prompts_and_decodes(scheduler_output)
-        num_prompts = len(pd_info.prompt_req_ids)
-        num_decodes = len(pd_info.decode_req_ids)
+
+        prompt_batch = self._prepare_prompt() if pd_info.prompt_req_ids else None
+        decode_batch = self._prepare_decode() if pd_info.decode_req_ids else None
+
+        hidden_states = None
+        if prompt_batch and decode_batch:
+            hidden_states = self._run_model(prompt_batch, intermediate_tensors)
+            hidden_states = self._run_model(decode_batch, intermediate_tensors)
+        elif prompt_batch:
+            hidden_states = self._run_model(prompt_batch, intermediate_tensors)
+        elif decode_batch:
+            hidden_states = self._run_model(decode_batch, intermediate_tensors)
+
+        logits = self.model.compute_logits(hidden_states, None)
+        argmax_token_ids = torch.argmax(logits, dim=-1).cpu().tolist()
+
         sampled_token_ids = [0] * self.input_batch.num_reqs
-
-        if num_prompts > 0 and num_decodes > 0:
-            raise NotImplementedError(
-                "Current does not support mixed batch inference " \
-                "with both prefill and decode.")
-        elif num_prompts > 0:
-            model_input = self._prepare_prompt()
-        elif num_decodes > 0:
-            model_input = self._prepare_decode()
-        else:
-            model_input = None
-
-        with set_forward_context(model_input.attn_metadata,
-                                    self.vllm_config):
-            assert self.model is not None
-            hidden_or_intermediate_states = self.model(input_ids=model_input.input_tokens,
-                                                        positions=model_input.input_positions,
-                                                        kv_caches=self.kv_caches,
-                                                        attn_metadata=model_input.attn_metadata,
-                                                        intermediate_tensors=intermediate_tensors,)
-            #TODO:For mixed batches of prefill and decode,
-            # the prepare_decode can be executed in parallel during the prefill inference phase.
-        logits = self.model.compute_logits(hidden_or_intermediate_states, None)
-
-        # Greedy sampling.
-        argmax_token_ids = torch.argmax(logits, dim=-1, keepdim=True)
-        argmax_token_ids = argmax_token_ids.squeeze(dim=-1)
-
-        # Transfer sampled tokens from TPU to CPU.
-        generate_token_ids_cpu = argmax_token_ids.cpu()
-
-        # self._statistics_time(t1, t2, t3, t4)
-
-        generate_token_ids_list = generate_token_ids_cpu.tolist()
-        # Update cached state
         req_ids = pd_info.prompt_req_ids + pd_info.decode_req_ids
-        for i in range(self.input_batch.num_reqs):
-            req_id = req_ids[i]
-            req_index = i
-            assert req_index == self.input_batch.req_id_to_index[req_id]
-            req_state = self.requests[req_id]
-            seq_len = req_state.num_computed_tokens + 1
-            if num_prompts > 0:
-                generate_token_index_ = sum(pd_info.prompt_scheduled_tokens[:i+1])
-                token_id = generate_token_ids_list[generate_token_index_-1]
-            else:
-                token_id = generate_token_ids_list[i]
-            sampled_token_ids[req_index] = token_id
-            self.input_batch.token_ids_cpu[req_index, seq_len] = token_id
-            self.input_batch.num_tokens[req_index] += 1
-            req_state.output_token_ids.append(token_id)
+        for i, req_id in enumerate(req_ids):
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            token_id = argmax_token_ids[i]
+            sampled_token_ids[req_idx] = token_id
+            self._update_single_request(req_id, token_id)
 
-        # Create output.
-        all_req_ids = pd_info.decode_req_ids + pd_info.prompt_req_ids
-        prompt_logprobs_dict: Dict[str, Optional[LogprobsTensors]] = {}
-        for req_id in all_req_ids:
-            prompt_logprobs_dict[req_id] = None
-        model_runner_output = ModelRunnerOutput(
-            req_ids=all_req_ids,
+        return ModelRunnerOutput(
+            req_ids=req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids=[[token_id] for token_id in sampled_token_ids],
+            sampled_token_ids=[[tid] for tid in sampled_token_ids],
             spec_token_ids=None,
             logprobs=None,
-            prompt_logprobs_dict=prompt_logprobs_dict,  # type: ignore[arg-type]
+            prompt_logprobs_dict={req_id: None for req_id in req_ids},
         )
 
-        return model_runner_output
+    def _run_model(self, model_input, intermediate_tensors):
+        with set_forward_context(model_input.attn_metadata, self.vllm_config):
+            return self.model(
+                input_ids=model_input.input_tokens,
+                positions=model_input.input_positions,
+                kv_caches=self.kv_caches,
+                attn_metadata=model_input.attn_metadata,
+                intermediate_tensors=intermediate_tensors,
+            )
+
+    def _update_single_request(self, req_id: int, token_id: int):
+        req_state = self.requests[req_id]
+        seq_len = req_state.num_computed_tokens + 1
+        req_idx = self.input_batch.req_id_to_index[req_id]
+        self.input_batch.token_ids_cpu[req_idx, seq_len] = token_id
+        self.input_batch.num_tokens[req_idx] += 1
+        req_state.output_token_ids.append(token_id)
 
     def load_model(self) -> None:
         self.model = get_model(vllm_config=self.vllm_config)

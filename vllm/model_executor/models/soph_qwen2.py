@@ -231,27 +231,14 @@ class Qwen2Attention(nn.Module):
 
         max_s = query.shape[0]
 
-        if attn_metadata.num_prefills is not None:
-
-            # Prefill
-            save_slots = attn_metadata.block_tables
-            fetch_slots = None
-            input_lengths = attn_metadata.effective_query_lens
-            max_s = input_lengths.max().item()
-
-            torch.ops.my_ops.llama_attention(attention_output[1], query, key, value, kv_cache[0], kv_cache[1],
-                                    cos, sin, input_lengths, save_slots, fetch_slots, None,
-                                    attn_metadata.block_tables.size(1), max_s, block_size, self.scaling, 2)
-
-        else:
-            # Decoding
-            save_slots = attn_metadata.slot_mapping
-            fetch_slots = attn_metadata.block_tables
-            input_lengths = attn_metadata.context_lens
-            max_s = input_lengths.max().item()
-            torch.ops.my_ops.llama_attention(attention_output[1], query, key, value, kv_cache[0], kv_cache[1],
-                                    cos, sin, input_lengths, save_slots, fetch_slots, None,
-                                    attn_metadata.block_tables.size(1), max_s, block_size, self.scaling, 3)
+        cache_length = attn_metadata.context_lens
+        input_length = attn_metadata.effective_query_lens if attn_metadata.effective_query_lens is not None \
+            else torch.zeros_like(attn_metadata.context_lens)
+        mode_tensor = torch.where(input_length > 1)[0]
+        torch.ops.my_ops.hybrid_attention(attention_output[1], mode_tensor, query, key, value, kv_cache[0], kv_cache[1],
+                                        cos, sin, input_length, cache_length, input_length+cache_length,
+                                        attn_metadata.slot_mapping, attn_metadata.block_tables, None,
+                                        attn_metadata.block_tables.size(1), max_s, block_size, self.scaling)
 
         # Reshape the output tensor.
         output, _ = self.o_proj(attention_output[1].view(-1, self.num_heads * self.head_dim), attention_output[2])
