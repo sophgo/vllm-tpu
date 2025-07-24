@@ -74,10 +74,7 @@ class SophTPUWorker:
 
         # Device initialization should happen after initializing
         # the distributed runtime.
-        import torch_tpu
-        options = torch_tpu.ProcessGroupSCCLOptions()
-        torch_tpu.tpu.set_chip_map(options, use_rank_table=False)
-        self.device = torch.device(f"tpu:{options.chip_map[self.local_rank]}")
+        self.device = torch.device(f"tpu:{self.local_rank}")
         self.device_config.device = self.device
 
         # Set random seed.
