@@ -29,6 +29,8 @@ from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
+from vllm.utils import get_dtype_size
+
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
 
@@ -350,7 +352,7 @@ class SophTPUModelRunner:
                     num_kv_heads=attn_module.num_kv_heads,
                     head_size=attn_module.head_size,
                     dtype=attn_module.dtype,
-                    use_mls=self.vllm_config.model_config.use_mla,
+                    use_mla=self.vllm_config.model_config.use_mla,
                 )
             elif attn_module.attn_type in (AttentionType.ENCODER,
                                            AttentionType.ENCODER_ONLY):
