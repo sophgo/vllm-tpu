@@ -405,6 +405,7 @@ class SophTPUModelRunner:
 
     def _prepare_prompt(
         self,
+        pd_info,
     ) -> Tuple[torch.Tensor, torch.Tensor, AttentionMetadata, List[int]]:
         input_tokens: List[int] = []
         input_positions: List[int] = []
@@ -412,18 +413,17 @@ class SophTPUModelRunner:
         prompt_lens: List[int] = []
         context_lens: List[int] = []
 
-        req_ids = self.input_batch.req_ids
+        req_ids = pd_info.prompt_req_ids
         block_tables = []
         max_blocks = 0
 
-        for req_id in req_ids:
+        for i, req_id in enumerate(req_ids):
             req_state = self.requests[req_id]
             prompt_token_ids = req_state.prompt_token_ids
             block_ids = req_state.block_ids
             num_computed = req_state.num_computed_tokens
             start_idx = max(0, len(prompt_token_ids) - self.sliding_window) if self.sliding_window else 0
-            process_tokens = prompt_token_ids[num_computed:num_computed+self.max_num_tokens]
-
+            process_tokens = prompt_token_ids[num_computed:num_computed+pd_info.prompt_scheduled_tokens[i]]
             # input_tokens\input_positions\prompt_lens\context_lens
             input_tokens.extend(process_tokens)
             input_positions.extend(range(num_computed, num_computed + len(process_tokens)))
@@ -473,27 +473,18 @@ class SophTPUModelRunner:
 
     def _prepare_decode(
         self,
+        req_ids,
     ) -> DecodeData:
         input_tokens: List[int] = []
         input_positions: List[int] = []
         slot_mapping: List[int] = []
         context_lens: List[int] = []
 
-        req_ids = self.input_batch.req_ids
         block_tables = []
         max_blocks = 0
-
         for req_id in req_ids:
             req_state = self.requests[req_id]
-            # generation_token = req_state.output_token_ids[-1]
-            if not req_state.output_token_ids:
-                if req_state.prompt_token_ids:
-                    generation_token = req_state.prompt_token_ids[-1]
-                else:
-                    # empty prompt，using BOS token
-                    generation_token = 1
-            else:
-                generation_token = req_state.output_token_ids[-1]
+            generation_token = req_state.output_token_ids[-1]
             seq_len = req_state.num_tokens
             position = seq_len - 1
             seq_len = seq_len if self.sliding_window is None else min(
@@ -555,28 +546,71 @@ class SophTPUModelRunner:
         self._update_states(scheduler_output)
         pd_info = self._get_prompts_and_decodes(scheduler_output)
 
-        prompt_batch = self._prepare_prompt() if pd_info.prompt_req_ids else None
-        decode_batch = self._prepare_decode() if pd_info.decode_req_ids else None
-
-        hidden_states = None
-        if prompt_batch and decode_batch:
-            hidden_states = self._run_model(prompt_batch, intermediate_tensors)
-            hidden_states = self._run_model(decode_batch, intermediate_tensors)
-        elif prompt_batch:
-            hidden_states = self._run_model(prompt_batch, intermediate_tensors)
-        elif decode_batch:
-            hidden_states = self._run_model(decode_batch, intermediate_tensors)
-
-        logits = self.model.compute_logits(hidden_states, None)
-        argmax_token_ids = torch.argmax(logits, dim=-1).cpu().tolist()
-
+        num_prompts = len(pd_info.prompt_req_ids)
         sampled_token_ids = [0] * self.input_batch.num_reqs
+
+        prompt_batch = self._prepare_prompt(pd_info) if pd_info.prompt_req_ids else None
+        decode_batch = self._prepare_decode(pd_info.decode_req_ids) if pd_info.decode_req_ids else None
+
+        hidden_or_intermediate_states = None
+        if prompt_batch and decode_batch:
+            # mixed batch sequential execution (prompt first, then decode)
+            decode_hidden = self._run_model(decode_batch, intermediate_tensors)
+            prompt_hidden = self._run_model(prompt_batch, intermediate_tensors)
+            hidden_or_intermediate_states = torch.cat([prompt_hidden, decode_hidden], dim=0)
+        elif prompt_batch:
+            hidden_or_intermediate_states = self._run_model(prompt_batch, intermediate_tensors)
+        elif decode_batch:
+            hidden_or_intermediate_states = self._run_model(decode_batch, intermediate_tensors)
+        else:
+            raise RuntimeError(
+                "At least one of `prompt_batch` or `decode_batch` must be non-empty. "
+                "Received empty inputs.")
+
+        logits = self.model.compute_logits(hidden_or_intermediate_states, None)
+        # Greedy sampling.
+        argmax_token_ids = torch.argmax(logits, dim=-1, keepdim=True)
+        argmax_token_ids = argmax_token_ids.squeeze(dim=-1)
+        # Transfer sampled tokens from TPU to CPU.
+        generate_token_ids_cpu = argmax_token_ids.cpu()
+        # self._statistics_time(t1, t2, t3, t4)
+        generate_token_ids_list = generate_token_ids_cpu.tolist()
+
+        # Update cached state
         req_ids = pd_info.prompt_req_ids + pd_info.decode_req_ids
         for i, req_id in enumerate(req_ids):
-            req_idx = self.input_batch.req_id_to_index[req_id]
-            token_id = argmax_token_ids[i]
-            sampled_token_ids[req_idx] = token_id
-            self._update_single_request(req_id, token_id)
+            req_index = self.input_batch.req_id_to_index[req_id]
+            req_state = self.requests[req_id]
+            seq_len = req_state.num_computed_tokens + 1
+            is_prefill = req_id in pd_info.prompt_req_ids
+
+            # batch with prefill-chunking
+            if is_prefill and req_state.num_computed_tokens < len(req_state.prompt_token_ids):
+                generate_token_index_ = sum(pd_info.prompt_scheduled_tokens[:i+1])
+                token_id = generate_token_ids_list[generate_token_index_-1]
+                # Determine whether prefill-chunking is complete
+                num_prefill_tokens_remained = len(req_state.prompt_token_ids)-req_state.num_computed_tokens
+                if num_prefill_tokens_remained <= self.max_num_tokens:
+                    # end of prefill-chunking, generate the first token
+                    req_state.output_token_ids.append(token_id)
+            elif num_prompts > 0:
+                # decode in mixed batch
+                generate_token_index_all_prompt = sum(pd_info.prompt_scheduled_tokens[:i+1])
+                token_id = generate_token_ids_list[i - num_prompts + generate_token_index_all_prompt]
+                req_state.output_token_ids.append(token_id)
+            else:
+                # decode
+                token_id = generate_token_ids_list[i]
+                req_state.output_token_ids.append(token_id)
+
+            sampled_token_ids[req_index] = token_id
+            self.input_batch.token_ids_cpu[req_index, seq_len] = token_id
+            self.input_batch.num_tokens[req_index] += 1
+
+        # Create output.
+        prompt_logprobs_dict: Dict[str, Optional[LogprobsTensors]] = {}
+        for req_id in req_ids:
+            prompt_logprobs_dict[req_id] = None
 
         return ModelRunnerOutput(
             req_ids=req_ids,
@@ -596,14 +630,6 @@ class SophTPUModelRunner:
                 attn_metadata=model_input.attn_metadata,
                 intermediate_tensors=intermediate_tensors,
             )
-
-    def _update_single_request(self, req_id: int, token_id: int):
-        req_state = self.requests[req_id]
-        seq_len = req_state.num_computed_tokens + 1
-        req_idx = self.input_batch.req_id_to_index[req_id]
-        self.input_batch.token_ids_cpu[req_idx, seq_len] = token_id
-        self.input_batch.num_tokens[req_idx] += 1
-        req_state.output_token_ids.append(token_id)
 
     def load_model(self) -> None:
         self.model = get_model(vllm_config=self.vllm_config)
