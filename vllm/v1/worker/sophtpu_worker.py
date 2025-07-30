@@ -14,6 +14,7 @@ from vllm.distributed import (init_distributed_environment, ensure_model_paralle
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.platforms.sophtpu import get_soph_config_manager
 from vllm.v1.core.scheduler import SchedulerOutput
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
@@ -94,11 +95,8 @@ class SophTPUWorker:
 
         Unit: bytes
         '''
-        tp_size = get_tensor_model_parallel_world_size()
 
-        total_tokens_max = self.model_config.max_model_len
-
-        batch_size_max = 128
+        max_model_len = self.model_config.max_model_len
 
         num_hidden_layers = self.model_config.hf_text_config.num_hidden_layers
         num_heads = self.model_config.get_num_kv_heads(self.parallel_config)
@@ -106,8 +104,14 @@ class SophTPUWorker:
 
         bytes_per_elem = torch.tensor([], dtype=self.cache_dtype).element_size()
 
+        soph_config_manager = get_soph_config_manager()
+        print(soph_config_manager)
+        batch_size = soph_config_manager.get('CURRENT_BATCH_SIZE')
+        if batch_size is None:
+            batch_size = 128
+
         coef = 1 if self.model_config.use_mla else 2
-        kvcache_memory = coef * batch_size_max * num_hidden_layers * total_tokens_max * num_heads * head_dim * bytes_per_elem
+        kvcache_memory = coef * num_hidden_layers * batch_size * max_model_len * num_heads * head_dim * bytes_per_elem
         kvcache_memory = kvcache_memory * 1.1  # Redundant memory
         return kvcache_memory
 

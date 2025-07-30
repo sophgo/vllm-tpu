@@ -62,8 +62,8 @@ class SophTPUMetadata(AttentionMetadata):
     # Currently, input sequences can only contain all prefills
     # or all decoding.
     block_tables: Optional[torch.Tensor] = None
-    context_lens: Optional[torch.Tensor] = None
-    effective_query_lens: Optional[torch.Tensor] = None
+    input_lengths: Optional[torch.Tensor] = None
+    cache_lengths: Optional[torch.Tensor] = None
 
     @property
     def prefill_metadata(self) -> Optional["SophTPUMetadata"]:

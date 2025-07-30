@@ -1,6 +1,10 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -120,3 +124,64 @@ class SophTpuPlatform(Platform):
             np.random.seed(seed)
             torch_tpu.tpu.manual_seed_all(seed)
 
+class SophConfigManager:
+    def __init__(self):
+        self.config: Dict[str, Any] = {}
+        default_config = self._create_default_config()
+        self.config = default_config
+
+    def _create_default_config(self) -> None:
+        return {
+            "SIMULATE_RANK_NUM": int(os.getenv("SIMULATE_RANK_NUM", "1")),
+            "SLOG_LEVEL": os.getenv("SLOG_LEVEL", "INFO"),
+            "USE_SOPHTPU": os.getenv("DEVICE", "").upper() != "GPU",
+            "KVCACHE_BLOCKS": int(os.getenv('KVCACHE_BLOCKS', '1024')),
+            
+            # Some global variables about DEBUG
+            "DEBUG_MODE": os.getenv("DEBUG_MODE", "OFF").upper() == "ON",
+            "DECODE_TOKEN_LEN": int(os.getenv("DECODE_TOKEN_LEN", "1024")),
+            "DEBUG_HIDDEN_LAYERS": int(os.getenv("DEBUG_HIDDEN_LAYERS", "1")),
+            "TENSOR_DUMP": os.getenv("TENSOR_DUMP", "OFF").upper() == "ON",
+            "TENSOR_DUMP_PATH": os.getenv("TENSOR_DUMP_PATH", "/workspace/dumped_tensors/"),
+            
+            "CONTEXT_LEN": int(os.getenv("CONTEXT_LEN", "6")),
+            "MAX_IMG_TOKEN": int(os.getenv("MAX_IMG_TOKEN", "3000")),
+            "ENABLE_PROFILE": int(os.getenv("ENABLE_PROFILE", "0")),
+            "PROFILE_BOOK_KEEPING": int(os.getenv("PROFILE_BOOK_KEEPING", "1")),
+            "PROFILE_STARTING_TOKEN": int(os.getenv("PROFILE_STARTING_TOKEN", "1")),
+            "MAX_TOTAL_TOKENS": int(os.getenv('MAX_TOTAL_TOKENS', '4046')),
+            
+            "RANK": self._get_rank_value(),
+            "WORLD_SIZE": self._get_world_size_value(),
+            "LOCAL_WORLD_SIZE": str(os.getenv('WORLD_SIZE', '1')),
+            "LOCAL_RANK": str(os.getenv('RANK', '0')),
+            
+            "SKIP_H2D": os.getenv("SKIP_H2D", "OFF").upper() == "ON",
+            "USE_DUMMY_DATA": os.getenv("USE_DUMMY_DATA", "OFF").upper() == "ON",
+            "BACKBONE_CMD_FORBID": os.getenv("BACKBONE_CMD_FORBID", "OFF").upper() == "ON",
+            
+            # Runtime dynamic variables
+            "CURRENT_BATCH_SIZE": None,
+            "NUM_PROMPTS_TOTAL_TOKENS": None
+        }
+
+    def _get_rank_value(self) -> int:
+        if os.getenv("OMPI_COMM_WORLD_RANK"):
+            return int(os.getenv("OMPI_COMM_WORLD_RANK"))
+        return int(os.getenv("RANK", "0"))
+
+    def _get_world_size_value(self) -> int:
+        if os.getenv("OMPI_COMM_WORLD_SIZE"):
+            return int(os.getenv("OMPI_COMM_WORLD_SIZE"))
+        return int(os.getenv("WORLD_SIZE", "1"))
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.config.get(key, default)
+
+_config_manager: Optional[SophConfigManager] = None
+
+def get_soph_config_manager() -> SophConfigManager:
+    global _config_manager
+    if _config_manager is None:
+        _config_manager = SophConfigManager()
+    return _config_manager

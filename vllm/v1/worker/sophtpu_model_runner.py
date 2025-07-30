@@ -19,7 +19,7 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.sampling_params import SamplingType
-from vllm.utils import LayerBlockType, cdiv, is_pin_memory_available
+from vllm.utils import LayerBlockType, cdiv, is_pin_memory_available, get_dtype_size
 from vllm.attention.backends.sophtpu_attn import (SophTPUAttentionBackend,
                                                   SophTPUMetadata)
 from vllm.sequence import IntermediateTensors
@@ -411,7 +411,7 @@ class SophTPUModelRunner:
         input_positions: List[int] = []
         slot_mapping: List[int] = []
         prompt_lens: List[int] = []
-        context_lens: List[int] = []
+        cache_lengths: List[int] = []
 
         req_ids = pd_info.prompt_req_ids
         block_tables = []
@@ -428,7 +428,7 @@ class SophTPUModelRunner:
             input_tokens.extend(process_tokens)
             input_positions.extend(range(num_computed, num_computed + len(process_tokens)))
             prompt_lens.append(len(process_tokens))
-            context_lens.append(num_computed)
+            cache_lengths.append(num_computed)
 
             # slot_mapping
             for i in range(len(process_tokens)):
@@ -451,7 +451,7 @@ class SophTPUModelRunner:
         input_tokens = torch.tensor(input_tokens, dtype=torch.int32, device=self.device)
         input_positions = torch.tensor(input_positions, dtype=torch.int32, device=self.device)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device=self.device)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, device="cpu")
+        cache_lengths = torch.tensor(cache_lengths, dtype=torch.int32, device="cpu")
         prompt_lens_tensor = torch.tensor(prompt_lens, dtype=torch.int32, device="cpu")
         padded_block_tables = [seq + [0] * (max_blocks - len(seq)) for seq in block_tables]
         block_tables_tensor = torch.tensor(padded_block_tables, dtype=torch.int32, device=self.device)
@@ -463,8 +463,8 @@ class SophTPUModelRunner:
             num_prefill_tokens=len(input_tokens),
             enable_kv_scales_calculation=True,
             block_tables=block_tables_tensor,
-            context_lens=context_lens,
-            effective_query_lens=prompt_lens_tensor,
+            cache_lengths=cache_lengths,
+            input_lengths=prompt_lens_tensor,
             multi_modal_placeholder_index_maps=None
         )
 
@@ -478,24 +478,28 @@ class SophTPUModelRunner:
         input_tokens: List[int] = []
         input_positions: List[int] = []
         slot_mapping: List[int] = []
-        context_lens: List[int] = []
+        cache_lengths: List[int] = []
+        input_lengths: List[int] = []
 
         block_tables = []
         max_blocks = 0
         for req_id in req_ids:
             req_state = self.requests[req_id]
-            generation_token = req_state.output_token_ids[-1]
+            output_token_ids = req_state.output_token_ids
+            generation_token = output_token_ids[-1]
             seq_len = req_state.num_tokens
+            num_computed = req_state.num_computed_tokens
             position = seq_len - 1
             seq_len = seq_len if self.sliding_window is None else min(
                 seq_len, self.sliding_window)
             block_ids = req_state.block_ids
             start_idx = max(0, seq_len - self.sliding_window) if self.sliding_window else 0
-
-            # input_tokens\input_positions\context_lens
+            
+            # input_tokens\input_positions\cache_lengths
             input_tokens.append(generation_token)
             input_positions.append(position)
-            context_lens.append(seq_len)
+            cache_lengths.append(num_computed)
+            input_lengths.append(int(1))
 
             # slot_mapping
             global_pos = req_state.num_computed_tokens
@@ -517,7 +521,8 @@ class SophTPUModelRunner:
         input_tokens = torch.tensor(input_tokens, dtype=torch.int32, device=self.device)
         input_positions = torch.tensor(input_positions, dtype=torch.int32, device=self.device)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device=self.device)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, device="cpu")
+        cache_lengths = torch.tensor(cache_lengths, dtype=torch.int32, device="cpu")
+        input_lengths = torch.tensor(input_lengths, dtype=torch.int32, device="cpu")
         padded_block_tables = [seq + [0] * (max_blocks - len(seq)) for seq in block_tables]
         block_tables_tensor = torch.tensor(padded_block_tables, dtype=torch.int32, device=self.device)
 
@@ -529,7 +534,8 @@ class SophTPUModelRunner:
             multi_modal_placeholder_index_maps=None,
             enable_kv_scales_calculation=False,
             block_tables=block_tables_tensor,
-            context_lens=context_lens,
+            cache_lengths=cache_lengths,
+            input_lengths=input_lengths
         )
 
         return DecodeData(input_tokens=input_tokens,
@@ -817,7 +823,7 @@ class SophTPUModelRunner:
         for layer_name, layer_spec in kv_cache_config.kv_cache_spec.items():
             tensor_config = kv_cache_config.tensors[layer_name]
             assert tensor_config.size % layer_spec.page_size_bytes == 0
-            num_blocks = tensor_config.size // layer_spec.page_size_bytes // 100
+            num_blocks = tensor_config.size // layer_spec.page_size_bytes
             if isinstance(layer_spec, SophAttentionSpec):
                 kv_cache_shape = SophTPUAttentionBackend.get_kv_cache_shape(
                     num_blocks, layer_spec.block_size, layer_spec.num_kv_heads,

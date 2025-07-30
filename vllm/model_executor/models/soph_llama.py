@@ -209,31 +209,27 @@ class LlamaAttention(nn.Module):
         cos,
         sin,
         kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        block_tables,
+        slots,
+        input_lengths,
+        cache_lengths,
+        prompt_lengths,
+        max_s,
+        mode_tensor,
+        mask,
         attention_output: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states, attention_output[0])
         query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-
-        #q, k = self.rotary_emb(positions, q, k)
-        #attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
 
         query = query.view(-1, self.num_heads, self.head_dim)
         key = key.view(-1, self.num_kv_heads, self.head_dim)
         value = value.view(-1, self.num_kv_heads, self.head_dim)
 
         block_size = int(kv_cache[1].shape[1])
-
-        max_s = query.shape[0]
-
-        cache_length = attn_metadata.context_lens
-        input_length = attn_metadata.effective_query_lens if attn_metadata.effective_query_lens is not None \
-            else torch.zeros_like(attn_metadata.context_lens)
-        mode_tensor = torch.where(input_length > 1)[0]
         torch.ops.my_ops.hybrid_attention(attention_output[1], mode_tensor, query, key, value, kv_cache[0], kv_cache[1],
-                                        cos, sin, input_length, cache_length, input_length+cache_length,
-                                        attn_metadata.slot_mapping, attn_metadata.block_tables, None,
-                                        attn_metadata.block_tables.size(1), max_s, block_size, self.scaling)
+                                        cos, sin, input_lengths, cache_lengths, prompt_lengths, slots, block_tables, mask,
+                                        block_tables.size(1), max_s, block_size, self.scaling)
 
         # Reshape the output tensor.
         output, _ = self.o_proj(attention_output[1].view(-1, self.num_heads * self.head_dim), attention_output[2])
@@ -304,7 +300,14 @@ class LlamaDecoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata,
+        block_tables,
+        slots,
+        input_lengths,
+        cache_lengths,
+        prompt_lengths,
+        max_s,
+        mode_tensor,
+        mask,
         residual: Optional[torch.Tensor],
         cos: torch.Tensor,
         sin: torch.Tensor,
@@ -342,7 +345,14 @@ class LlamaDecoderLayer(nn.Module):
             cos,
             sin,
             kv_cache,
-            attn_metadata,
+            block_tables,
+            slots,
+            input_lengths,
+            cache_lengths,
+            prompt_lengths,
+            max_s,
+            mode_tensor,
+            mask,
             attn_buffer
         )
 
@@ -465,12 +475,28 @@ class LlamaModel(nn.Module):
         rms_buffer = self.rms_buffer
         attn_buffer = self.attn_buffer
 
+        block_tables = attn_metadata.block_tables
+        slots = attn_metadata.slot_mapping
+        input_lengths = attn_metadata.input_lengths
+        cache_lengths = attn_metadata.cache_lengths
+        prompt_lengths = input_lengths + cache_lengths
+        max_s = prompt_lengths.max().item()
+        mode_tensor = torch.where(input_lengths > 1)[0]
+        mask = None
+
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 hidden_states,
                 kv_caches[i - self.start_layer],
-                attn_metadata,
+                block_tables,
+                slots,
+                input_lengths,
+                cache_lengths,
+                prompt_lengths,
+                max_s,
+                mode_tensor,
+                mask,
                 residual,
                 cos,
                 sin,

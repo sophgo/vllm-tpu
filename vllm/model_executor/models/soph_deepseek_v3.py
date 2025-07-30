@@ -31,7 +31,7 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 import numpy as np
 
-from vllm.platforms import soph_config
+from vllm.platforms.sophtpu import get_soph_config_manager
 from vllm.attention import Attention, AttentionMetadata, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
@@ -69,7 +69,6 @@ from .utils import (PPMissingLayer, is_pp_missing_parameter,
 
 # def print_tensor_info(name, param):
 #     print(f"  - {name}:", end=" ")
-
 #     if torch.is_tensor(param):
 #         print(f"shape = {param.shape} | dtype = {param.dtype}", end=" ")
 #         if param.dtype != torch.bool:
@@ -328,8 +327,8 @@ class DeepseekV3Attention(torch.nn.Module):
 
         # register kv-cache buffer and pe-cache buffer, {batch, seqlen, kv_lora_rank}
         import os
-        self.max_cache_size = soph_config.CONTEXT_LEN + soph_config.DECODE_TOKEN_LEN + int(os.getenv("chat_token_num", "0"))
-
+        soph_config_manager = get_soph_config_manager()
+        self.max_cache_size = soph_config_manager.get('CONTEXT_LEN') + soph_config_manager.get('DECODE_TOKEN_LEN') + int(os.getenv("chat_token_num", "0"))
         self.kv_cache = None
         self.pe_cache = None
         self.use_paged_kv_cache = True
@@ -355,6 +354,8 @@ class DeepseekV3Attention(torch.nn.Module):
         block_tables: torch.Tensor,
         slots: torch.Tensor,
         input_lengths,
+        cache_lengths,
+        kvu,
         max_s: int,
         mask,
         attention_output,
@@ -421,6 +422,7 @@ class DeepseekV3Attention(torch.nn.Module):
                 sin,
                 self.q_b_weight[1],
                 self.kv_b_weight[1],
+                kvu,
                 mask,
                 input_lengths,
                 self.num_heads,
@@ -450,8 +452,10 @@ class DeepseekV3Attention(torch.nn.Module):
                 self.kv_b_weight[1],
                 block_tables,
                 slots if cu_seqlen_prefill is None else block_tables,
+                kvu,
                 mask,
                 input_lengths,
+                cache_lengths,
                 self.num_heads,
                 1,
                 self.q_lora_rank,
@@ -612,7 +616,7 @@ class DeepseekV3MoE(nn.Module):
             raise NotImplementedError(
                 f"insupportable scoring function for MoE gating: {self.scoring_func}"
             )
- 
+
         torch.topk(
             router_logits, k=self.top_k, dim=-1, sorted=False,
             out=(routing_weights, selected_experts))
@@ -717,6 +721,8 @@ class DeepseekV3DecoderLayer(nn.Module):
         block_tables: torch.Tensor,
         slots: torch.Tensor,
         input_lengths,
+        cache_lengths,
+        kvu,
         max_s: int,
         mask,
         attn_buffer,
@@ -737,6 +743,8 @@ class DeepseekV3DecoderLayer(nn.Module):
             block_tables,
             slots,
             input_lengths,
+            cache_lengths,
+            kvu,
             max_s,
             mask,
             attn_buffer
@@ -894,16 +902,17 @@ class DeepseekV3Model(torch.nn.Module):
 
         # Attention metadata
         cu_seqlen_prefill = attn_metadata.num_prefills
-        if cu_seqlen_prefill is not None:
-            input_lengths = attn_metadata.effective_query_lens
-        else:
-            input_lengths = attn_metadata.context_lens
-        max_s = input_lengths.max().item()
-        mask = None
-        if cu_seqlen_prefill is not None:
-            mask = torch.triu(torch.full((max_s, max_s), -65504.0, dtype=default_dtype), diagonal=1).to(default_device)
         block_tables = attn_metadata.block_tables
         slots = attn_metadata.slot_mapping
+        input_lengths = attn_metadata.input_lengths
+        cache_lengths = attn_metadata.cache_lengths
+        input_lengths = input_lengths + cache_lengths
+        max_s = input_lengths.max().item()
+        mask = None 
+
+        kvu = None
+        if cu_seqlen_prefill is not None:
+            kvu = torch.empty((max_s, self.num_heads, self.qk_nope_head_dim + self.value_head_size), dtype = default_dtype, device = default_device)
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -917,6 +926,8 @@ class DeepseekV3Model(torch.nn.Module):
                 block_tables,
                 slots,
                 input_lengths,
+                cache_lengths,
+                kvu,
                 max_s,
                 mask,
                 attn_buffer,

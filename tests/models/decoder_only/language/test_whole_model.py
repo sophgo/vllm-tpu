@@ -9,8 +9,9 @@ import math
 # import sccl
 import sys
 import argparse
+from transformers import AutoTokenizer
 
-from vllm.platforms import soph_config
+from vllm.platforms.sophtpu import get_soph_config_manager
 from vllm.logger import init_logger
 from vllm.engine.llm_engine import LLMEngine
 from vllm.usage.usage_lib import UsageContext
@@ -27,7 +28,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--model",
     type=str,
-    default="deepseek_v3",
+    default="qwen2-7b",
     # required=True,
     choices=["llama2-7b", "llama3.1-8b", "qwen2.5-32b", "qwen2.5-14b", "qwen2.5-7b","qwen2-7b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b",
              "qwq", "deepseek_v2", "deepseek_v3"],
@@ -40,11 +41,11 @@ parser.add_argument(
     choices=["gptq", "awq"],
     help="Quantization method (e.g., gptq, awq)",
 )
-parser.add_argument("--batch", type=int, default=1, help="Batch size for testing")
-parser.add_argument("--path", type=str, default="/data/", help="Path to model dir")
+parser.add_argument("--batch", type=int, default=16, help="Batch size for testing")
+parser.add_argument("--path", type=str, default="/workspace/data/data/", help="Path to model dir")
 parser.add_argument("--mode", type=str, default="chat", choices=["chat", "generation"], help="Run with chat mode or generation mode")
 parser.add_argument("--useV1", type=bool, default=True, help="Use vLLM V1. Set False to use V0.")
-parser.add_argument("--tp_size", type=int, default=8, help="Tensor Parallel size. Set to 1 to disable tensor parallel.")
+parser.add_argument("--tp_size", type=int, default=2, help="Tensor Parallel size. Set to 1 to disable tensor parallel.")
 args = parser.parse_args()
 
 RANK = int(os.environ.get("OMPI_COMM_WORLD_RANK", "0"))
@@ -57,12 +58,11 @@ log_file = f"{os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__
 if os.path.exists(log_file):
     os.remove(log_file)
 # logger.add(log_file, level=soph_config.SLOG_LEVEL)
+soph_config_manager = get_soph_config_manager()
+DECODE_TOKEN_LEN = soph_config_manager.get('DECODE_TOKEN_LEN')
+CONTEXT_LEN = soph_config_manager.get('CONTEXT_LEN')
 
-# DECODE_TOKEN_LEN = soph_config.DECODE_TOKEN_LEN
-DECODE_TOKEN_LEN = 128
-CONTEXT_LEN = soph_config.CONTEXT_LEN
-
-def default_llm_engine(model, quantize, path, use_v1, tp_size):
+def default_llm_engine(model, quantize, path, use_v1, tp_size, batches):
     model_configs = {
         "llama2-7b": {
             "gptq": {"model_id": "Llama-2-7b-Chat-GPTQ", "dtype": "float16"},
@@ -110,16 +110,21 @@ def default_llm_engine(model, quantize, path, use_v1, tp_size):
         },
     }
 
-
     model_info = model_configs.get(model, {}).get(quantize, model_configs.get(model, {}).get("default"))
     if model_info is None:
         raise ValueError(f"Unsupported model or quantization: {model}, {quantize}")
     model_id = os.path.join(path, model_info["model_id"])
+
+    prompts, num_prompts_total_tokens = defatult_multi_batch_prompt(model_id, batches)
+    soph_config_manager.config['CURRENT_BATCH_SIZE'] = batches
+    max_model_len = DECODE_TOKEN_LEN + math.ceil(num_prompts_total_tokens / batches) # max_len per (prompot+decodes)
+
     dtype = model_info["dtype"]
 
     engine_args = EngineArgs(
         model=model_id,
         dtype=dtype,
+        max_model_len=max_model_len,
         enforce_eager=True,
         trust_remote_code=True,
         tensor_parallel_size=tp_size,
@@ -135,7 +140,7 @@ def default_llm_engine(model, quantize, path, use_v1, tp_size):
 
     llm_engine = engine_class.from_engine_args(
         engine_args, usage_context=UsageContext.LLM_CLASS)
-    return llm_engine
+    return llm_engine, prompts
 
 def get_default_sampling_params(llm_engine) -> SamplingParams:
     diff_sampling_param = (
@@ -197,7 +202,7 @@ CHAT_WRAPPER_TOKEN_NUM = {model: llama_wrapper_token for model in llama_models}
 CHAT_WRAPPER_TOKEN_NUM.update({model: qwen_wrapper_token for model in qwen_models})
 CHAT_WRAPPER_TOKEN_NUM.update({model: deepseek_wrapper_token for model in deepseek_models})
 
-def defatult_multi_batch_prompt(num_request, mode="chat"):
+def defatult_multi_batch_prompt(model_id, num_request, mode="chat"):
     if os.path.exists('questions.txt'):
         with open('questions.txt', 'r', encoding='utf-8') as f:
             questions = [line.strip() for line in f.readlines() if line.strip() and not line.startswith('#')]
@@ -208,7 +213,7 @@ def defatult_multi_batch_prompt(num_request, mode="chat"):
         questions = [
             "What is Deep Learning?",
             #"What is TPU?",
-            #"Consider a scenario where an autonomous vehicle must make an ethical decision between two unavoidable outcomes: saving the passengers inside the vehicle or protecting pedestrians. Discuss how a large language model (LLM) could be integrated into the vehicle's decision-making system to assist with ethical considerations. What are the potential benefits and limitations of relying on an LLM for such critical decisions?",
+            # "Consider a scenario where an autonomous vehicle must make an ethical decision between two unavoidable outcomes: saving the passengers inside the vehicle or protecting pedestrians. Discuss how a large language model (LLM) could be integrated into the vehicle's decision-making system to assist with ethical considerations. What are the potential benefits and limitations of relying on an LLM for such critical decisions?",
         ] * num_request
         question_length = [5] * num_request
 
@@ -216,7 +221,7 @@ def defatult_multi_batch_prompt(num_request, mode="chat"):
         questions = [CHAT_WRAPPER[args.model](question + ". " * max(0, CONTEXT_LEN - qlen - CHAT_WRAPPER_TOKEN_NUM[args.model])) for qlen, question in zip(question_length, questions)]
     elif mode == "generation":
         questions = [". " * max(0, CONTEXT_LEN - 5) + question for question in questions]
-    PRINT_LEN = 1024
+    PRINT_LEN = 32
     if CONTEXT_LEN > PRINT_LEN:
         questions_p = [question[:PRINT_LEN] + " ..." for question in questions]
         logger.info(f"Questions: {questions_p}")
@@ -224,18 +229,26 @@ def defatult_multi_batch_prompt(num_request, mode="chat"):
         logger.info(f"Questions: {questions}")
 
     prompts = cast(Union[PromptType, Sequence[PromptType]],questions)
-    return prompts
 
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if tokenizer:
+        total_tokens = 0
+        for prompt in questions:
+            tokens = tokenizer.encode(prompt, add_special_tokens=False)
+            total_tokens += len(tokens)
+
+    return prompts, total_tokens
 
 def test_whole_model(
     batches=1, model_id="llama", model_path="/data", quantize=None, mode="chat", use_v1=True, tp_size=2
 ):
     logger.info(f"Model id: {model_id}, Quantize: {quantize}, Batch: {batches}")
-    enable_profile = soph_config.ENABLE_PROFILE
-    book_keeping = soph_config.PROFILE_BOOK_KEEPING
-    profile_starting_token = soph_config.PROFILE_STARTING_TOKEN
+    enable_profile = soph_config_manager.get('ENABLE_PROFILE')
+    book_keeping = soph_config_manager.get('PROFILE_BOOK_KEEPING')
+    profile_starting_token = soph_config_manager.get('PROFILE_STARTING_TOKEN')
     max_record_num = int(1e6)
-    llm_engine = default_llm_engine(model_id, quantize, model_path, use_v1, tp_size)
+    llm_engine, prompts = default_llm_engine(model_id, quantize, model_path, use_v1, tp_size, batches)
     import torch_tpu
 
     for it in range(2):
@@ -247,8 +260,7 @@ def test_whole_model(
         sampling_params = SamplingParams(max_tokens=DECODE_TOKEN_LEN, temperature=0)
         if sampling_params is None:
             sampling_params = get_default_sampling_params(llm_engine)
-        prompts = defatult_multi_batch_prompt(batches)
-        
+
         # Add requests to llm_engine Obj
         validate_and_add_requests(
             llm_engine=llm_engine,

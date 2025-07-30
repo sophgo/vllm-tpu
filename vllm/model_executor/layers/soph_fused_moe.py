@@ -18,7 +18,6 @@ import numpy as np
 
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.layers.soph_linear import soph_to_dtype
-from vllm.platforms import soph_config
 from vllm.attention import Attention, AttentionMetadata, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
