@@ -7,7 +7,7 @@
 vLLM项目代码、docker镜像、主要模型权重/数据集等资源在 FTP 服务器上存放路径：
 `ftp://172.28.141.89/LLMs/vLLM
 
-### TGI模型支持列表
+### 模型支持列表
 
 | 模型名称      | 权重类型    | 模型链接     |
 |---------------|-------------|------------|
@@ -111,6 +111,106 @@ tar -xvf torch-tpu_*.tar.gz
 pip install dist/torch_tpu-*_x86_64.whl --force-reinstall
 ```
 
+## 启动模型推理服务
+
+### 启动docker容器
+
+```shell
+docker run --privileged -itd --restart always \
+    --name <CONTAINER_NAME> \
+    --shm-size 1g \
+    -p 8080:80 \
+    -v $(pwd):/workspace \
+    -v /dev/:/dev/ \
+    -v <DATA_PATH>:/data \
+    -v /opt/tpuv7:/opt/tpuv7 \
+    --entrypoint /bin/bash \
+    soph_vllm:0.7.3
+```
+
+### 进入docker容器
+
+```shell
+docker exec -it <CONTAINER_NAME> bash
+```
+
+### 安装Torch-TPU whl包
+从FTP服务器上`torch_tpu/release_build/latest_release`目录下拉取torch-tpu whl包,进入docker容器并安装：
+
+```shell
+tar -xvf torch-tpu_*.tar.gz
+pip install dist/torch_tpu-*_x86_64.whl --force-reinstall
+```
+
+### 设置环境变量
+
+设置分布式环境变量`MASTER_ADDR`和`MASTER_PORT`，并设置使用V1引擎启动推理服务。
+
+```shell
+export MASTER_ADDR="127.0.0.1"
+export MASTER_PORT=29500
+export VLLM_USE_V1=1
+```
+
+### 启动推理服务
+
+使用`api_server`启动推理服务(以Qwen2-7B模型为例):
+
+```shell
+cd /workspace/vLLM
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /data/Qwen2-7B-Instruct/ \
+    --host localhost \
+    --port 8000 \
+    --served-model-name vllm \
+    --enforce-eager \
+    --tensor-parallel-size 1
+```
+其中各参数含义如下
+--model：必需参数，指定要加载的模型的路径
+--host：可选参数，服务器的主机地址，默认为localhost
+--port：可选参数，服务器的端口号，默认为8000
+--served-model-name：可选参数，自定义API返回的模型名称，默认为`--model`的传入参数
+--enforce-eager：必需参数，禁用CUDA图
+--tensor-parallel-size：可选参数，指定要推理的张量并行数量，默认为1
+
+### 发送请求
+
+#### 发送单个请求
+按如下格式向前文中映射的端口发送POST请求：
+
+```shell
+curl localhost:8000/v1/chat/completions \
+    -X POST \
+    -d '{
+  "model": "vllm",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant."
+    },
+    {
+      "role": "user",
+      "content": "What is deep learning?"
+    }
+  ],
+  "stream": false,
+  "max_tokens": 128
+}' \
+    -H 'Content-Type: application/json'
+```
+其中，可以设置最大生成token数量 `max_new_tokens`
+
+#### 模拟多用户发送请求
+
+打开一个新的终端并进入同一个docker，运行以下测试脚本可以模拟4个用户同时发送请求：
+
+```shell
+cd /workspace/vLLM/evaluation/stress/
+bash emulate_4_users.sh
+```
+
+结果会在终端输出，同时脚本所在目录将生成日志文件run_*.log。
 
 ## 单测/性能测试
 
@@ -144,7 +244,7 @@ pip install dist/torch_tpu-*_x86_64.whl --force-reinstall
 
 ### test_whole_model.py 单测脚本使用说明
 
-`test_whole_model.py`脚本用于测试SOPH TGI内LLM推理性能，相关参数如下：
+`test_whole_model.py`脚本用于测试SOPH vLLM内LLM推理性能，相关参数如下：
   - --model: 必需参数，指定要加载的模型的路径。
   - --quantize: 可选参数，指定强制加载的模型的数据类型，quantize为true时尽量量化模型推理。
   - --batch: 可选参数，默认构造单测批次为1。
@@ -213,6 +313,100 @@ CONTEXT_LEN=512 DECODE_TOKEN_LEN=32 test_whole_model.py --model qwen2-72b --quan
     share-mem-size=0x1e20000000
     ```
     重新加载驱动即可使配置生效。
+
+## Prefix-Caching功能测试
+
+### 功能介绍
+
+Prefix-Caching的核心思想是缓存系统提示和历史对话中的 KV Cache，以便在后续请求中复用，从而减少首次 Token 的计算开销。在长系统提示以及多轮对话的场景下，当一个新的请求到来的时候，通过前缀匹配查找新的请求是否命中缓存，如果命中了缓存，会复用KV Cache来完成这次请求。因此Prefix-Caching能够实现跨请求的 KV Cache 复用，从而显著提升 prefill 的性能，并降低新一轮请求的首次 Token 计算时间（Time To First Token，TTFT）。
+
+### 测试方法
+
+1. 启动推理服务
+
+首先进入docker并使用启动vLLM推理服务(以Qwen2-7B模型为例)：
+
+```shell
+cd /workspace/vLLM
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /data/Qwen2-7B-Instruct/ \
+    --host localhost \
+    --port 8000 \
+    --served-model-name vllm \
+    --enforce-eager \
+    --tensor-parallel-size 1 \
+    --enable-prefix-caching
+```
+其中：
+--enable-prefix-caching：可选参数，开启prefix-caching功能，默认开启。
+
+2. 运行测试脚本
+
+当服务成功Connected后，打开一个新的终端并进入同一个docker，运行测试脚本。
+
+设计了4个测试问题，分别放在long_question_1.txt，long_question_2.txt，long_question_3.txt，long_question_4.txt文件中。这4个问题以同一篇文章作为背景，在文章末尾给出4个简短的问题。为了模拟长系统提示以及多轮对话的场景，运行脚本将4个测试问题按照顺序发送到推理服务中：
+
+```shell
+cd /workspace/vLLM/evaluation/test_prefix_caching/
+bash emulate_1_user_prefix.sh
+```
+
+可以在vLLM推理服务启动的终端看到类似如下输出:
+```shell
+INFO 08-01 12:34:33 loggers.py:76] Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 24.9 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.1%, Prefix cache hit rate: 74.2%
+```
+
+其中`Prefix cache hit rate`表示所有请求累积的Prefix cache命中率，`Prefix cache hit rate>0`证明该功能起作用。
+
+同时，脚本所在目录将生成日志文件run_question*.log。
+通过检查日志中的输出结果可以验证功能的正确性：若输出内容通顺、连贯且合理，则证明prefix-caching功能正常。
+
+## Prefill-Chunking功能测试
+
+### 功能介绍
+当前推理框架中，Prefill阶段因密集计算表现为Compute-bound，而Decode阶段因频繁访存表现为Memory-bound，导致硬件资源利用不均衡。
+针对这一问题，Prefill-Chunking（预填充分块）将Prefill请求的 prompts 切分为多个长短大致相同的 chunks，在这些 chunks 做Prefill的同一时刻捎带处理其他已就绪的 Decode 请求，也就是将处于 Prefill 阶段的请求与处于 Decode 阶段的请求组成一个批次（batch）进行计算，从而实现算力和带宽的利用率最大化。
+此外，Prefill-Chunking功能也优化了用户体验。具体来说，传统实现中，TGI服务实例在同一时刻仅能处理单一阶段（Prefill优先），高并发时Decode易被阻塞，引发Token输出延迟。而Prefill-Chunking功能可以实现Decode Token连续输出，无需等待其他Prefill完成。
+
+不过，当前TPU架构暂不支持指令级并行，导致batch内的Decode和Prefill仍需顺序处理。这种做法虽然无法实现带宽和算力的利用率最大化，但能有效缓解Decode阻塞问题，提升用户体验。
+
+### 测试方法
+
+1. 启动推理服务
+
+首先进入docker并使用以下命令启动推理服务（以Qwen2-7B模型为例）：
+
+```shell
+python3 -m vllm.entrypoints.openai.api_server \
+    --model /data/Qwen2-7B-Instruct/ \
+    --host localhost \
+    --port 8000 \
+    --served-model-name vllm \
+    --enforce-eager \
+    --tensor-parallel-size 1 \
+    --enable-chunked-prefill true \
+    --max-num-batched-tokens 100 \
+    --max-num-seqs 32 \
+```
+
+其中各参数含义如下
+--enable-chunked-prefill：可选参数，开启Prefill-Chunking功能，默认开启。
+--max-num-batched-tokens：可选参数，多个请求总共可以处理的最大的prefill token数量,默认值为2048。
+--max-num-seqs：可选参数，同时处理的最大序列数，每个序列通常对应一个独立的用户请求，默认值为256。
+
+
+2. 运行测试脚本
+
+服务启动后，在新终端中进入同一Docker容器，执行测试脚本：
+
+```shell
+cd /workspace/vLLM/evaluation/test_prefill_chunking/
+bash emulate_4_users_prefill_chunking.sh
+```
+设计了5个测试问题，每个问题的token数量约为600。
+将`--max-num-batched-tokens`参数设置为`100`实现对prefill做多次切块，该参数设置得越小，切块数量越多，每块的prefill token数量越少。
+运行测试脚本，会同时将这5个问题发送到推理服务中，以模拟多轮对话场景。测试完成后，脚本所在目录将生成日志文件run_*_prefill.log。
+通过检查日志中的输出结果可以验证功能的正确性：若输出内容通顺、连贯且合理，则证明prefill-chunking功能正常。
 
 
 ## 开发者指南
