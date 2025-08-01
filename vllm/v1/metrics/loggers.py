@@ -30,6 +30,7 @@ class LoggingStatLogger(StatLoggerBase):
 
     def __init__(self):
         self._reset(time.monotonic())
+        self.prefix_caching_metrics = PrefixCachingMetrics()
 
     def _reset(self, now):
         self.last_log_time = now
@@ -37,9 +38,6 @@ class LoggingStatLogger(StatLoggerBase):
         # Tracked stats over current local logging interval.
         self.num_prompt_tokens: List[int] = []
         self.num_generation_tokens: List[int] = []
-
-        # Prefix cache metrics. TODO: Make the interval configurable.
-        self.prefix_caching_metrics = PrefixCachingMetrics()
 
     def _local_interval_elapsed(self, now: float) -> bool:
         # Log every _LOCAL_LOGGING_INTERVAL_SEC.
