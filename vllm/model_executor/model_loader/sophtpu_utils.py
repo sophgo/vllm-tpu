@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 
+from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
 import concurrent.futures
 
@@ -152,6 +153,7 @@ def weight_reorder(model_id, quantize, dtype, groupsize):
                         groupsize,
                         dtype
                     )
+        get_world_group().barrier()
         logger.warning(f"Weight reorder success.")
         return reorder_path
     else:

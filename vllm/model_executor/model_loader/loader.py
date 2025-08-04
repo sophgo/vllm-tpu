@@ -183,7 +183,7 @@ def _process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
             # of process_weights_after_loading
             module.process_weights_after_loading(model_config.dtype)
 
-    if  current_platform.is_sophtpu():
+    if  current_platform.is_sophtpu() and model_config.quantization is None:
         for name, module in model.named_modules():
             if isinstance(module, (SophRowParallelLinear, SophColumnParallelLinear, SophReplicatedLinear, SophDeepseekV3FusedMoE)):
                 # For all model weights used on SophTPU, perform type checking and conversion.

@@ -33,7 +33,7 @@ parser.add_argument(
     type=str,
     default="qwen2-7b",
     # required=True,
-    choices=["llama2-7b", "llama3.1-8b", "llama3.1-70b", "qwen2.5-32b", "qwen2.5-14b", "qwen2.5-7b","qwen2-7b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwen3-8b",
+    choices=["llama2-7b", "llama3.1-8b", "llama3.1-70b", "qwen2.5-32b", "qwen2.5-14b", "qwen2.5-7b","qwen2-7b", "qwen2-72b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwen3-8b", "qwen3-235b-a22b",
              "qwq", "deepseek_v2", "deepseek_v3"],
     help="Model name to test (e.g., llama2-7b, llama3.1-8b, llama3.1-70b, qwen2.5-32b, qwen2.5-14b, qwen2-7b, qwen2-57b-a14b, qwen3-32b, qwq, qwen3-8b, deepseek_v2, deepseek_v3)",
 )
@@ -77,11 +77,11 @@ def default_llm_engine(model, quantize, path, use_v1, tp_size, batches):
             "default": {"model_id": "llama-2-7b-chat-hf", "dtype": "float16"},
         },
         "llama3.1-8b": {
-            "gptq": {"model_id": "Meta-Llama-3.1-8B-Instruct-GPTQ-INT4", "dtype": "float16"},
-            "default": {"model_id": "Meta-Llama-3.1-8B-Instruct", "dtype": "float16"},
+            "gptq": {"model_id": "Llama-3.1-8B-Instruct-GPTQ-INT4", "dtype": "float16"},
+            "default": {"model_id": "Llama-3.1-8B-Instruct", "dtype": "float16"},
         },
         "llama3.1-70b": {
-            "gptq": {"model_id": "Meta-Llama-3-70B-Instruct-GPTQ-INT4", "dtype": "float16"},
+            "gptq": {"model_id": "Meta-Llama-3.1-70B-Instruct-GPTQ-INT4", "dtype": "float16"},
             "default": {"model_id": "Llama-3.1-70B-Instruct", "dtype": "float16"},
         },
         "qwen2.5-32b": {
@@ -96,6 +96,10 @@ def default_llm_engine(model, quantize, path, use_v1, tp_size, batches):
             "gptq": {"model_id": "Qwen2-7B-Instruct-GPTQ-Int4","dtype": "float16"},
             "default": {"model_id": "Qwen2-7B-Instruct", "dtype": "bfloat16"}
         },
+        "qwen2-72b": {
+            "gptq": {"model_id": "Qwen2-72B-Instruct-GPTQ-Int4","dtype": "float16"},
+            "default": {"model_id": "Qwen2-72B-Instruct", "dtype": "bfloat16"}
+        },        
         "qwen2-57b-a14b": {
             "gptq": {"model_id": "Qwen2-57B-A14B-Instruct-GPTQ-Int4","dtype": "float16"},
             "default": {"model_id": "Qwen2-57B-A14B-Instruct", "dtype": "bfloat16"}
@@ -107,6 +111,10 @@ def default_llm_engine(model, quantize, path, use_v1, tp_size, batches):
         "qwen3-8b": {
             "gptq": {"model_id": "Qwen3-8B","dtype": "float16"},
             "default": {"model_id": "Qwen3-8B", "dtype": "bfloat16"}
+        },
+        "qwen3-235b-a22b": {
+            "gptq": {"model_id": "Qwen3-235B-A22B","dtype": "float16"},
+            "default": {"model_id": "Qwen3-235B-A22B", "dtype": "bfloat16"}
         },
         "qwen3-32b": {
             "gptq": {"model_id": "Qwen3-32B-GPTQ-Int4","dtype": "bfloat16"},
@@ -207,7 +215,7 @@ def deepseek_chat_wrapper(question):
 
 # group model by model structure
 llama_models = ["llama2-7b", "llama3.1-8b", "llama3.1-70b"]
-qwen_models = ["qwen2.5-32b", "qwen2.5-14b", "qwen2-7b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwq", "qwen3-8b"]
+qwen_models = ["qwen2.5-32b", "qwen2.5-14b", "qwen2-7b","qwen2-72b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwq", "qwen3-8b", "qwen3-235b-a22b"]
 deepseek_models = ["deepseek_v2", "deepseek_v3"]
 # decide the chat wrapper by model type
 CHAT_WRAPPER = {model: llama_chat_wrapper for model in llama_models}
@@ -240,7 +248,7 @@ def defatult_multi_batch_prompt(model_id, num_request, mode="chat"):
         questions = [CHAT_WRAPPER[args.model](question + ". " * max(0, CONTEXT_LEN - qlen - CHAT_WRAPPER_TOKEN_NUM[args.model])) for qlen, question in zip(question_length, questions)]
     elif mode == "generation":
         questions = [". " * max(0, CONTEXT_LEN - 5) + question for question in questions]
-    PRINT_LEN = 32
+    PRINT_LEN = 128
     if CONTEXT_LEN > PRINT_LEN:
         questions_p = [question[:PRINT_LEN] + " ..." for question in questions]
         logger.info(f"Questions: {questions_p}")
@@ -344,7 +352,8 @@ def test_whole_model(
         TPOT = np.mean(time_list[1:]) / 1000**3
         Throughput = batches / TPOT * 1000**3
         for key in generated_text.keys():
-            logger.info(f"rank: {RANK}, Batch {key}: {repr(generated_text[key])}\n")
+            cleaned_text = generated_text[key].rstrip('\n')
+            logger.info(f"rank: {RANK}, Batch {key}: {cleaned_text}\n")
         logger.warning(f"FTL: {FTL_ms:.1f}ms, TPS: {TPS:.1f}")
         logger.warning(f'TTFT: {time_list[0] /1000**3:.3f}s, TPOT: {np.mean(time_list[1:]) /1000**3:.3f}s, Throughput: {batches / np.mean(time_list[1:]) *1000**3:.1f}, TPS: {1/ np.mean(time_list[1:]) *1000**3:.1f}')
         logger.info(f"-----------------------------")

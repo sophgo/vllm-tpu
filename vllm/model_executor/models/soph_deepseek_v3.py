@@ -1029,9 +1029,6 @@ class DeepseekV3ForCausalLM(nn.Module, SupportsPP):
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-            exclude_list = ['lm_head'] + ['model.norm'] + ['model.embed_tokens'] + [f'model.layers.{i}.' for i in range(self.config.num_hidden_layers)]  # 前config.num_hidden_layer层
-            if all(exclude_str not in name for exclude_str in exclude_list):
-                continue
 
             if "rotary_emb.inv_freq" in name:
                 continue

@@ -9,6 +9,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from vllm import _custom_ops as ops
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig)
@@ -291,7 +292,9 @@ class SophGPTQLinearMethod(GPTQLinearMethod):
         quant_config: The GPTQ quantization config.
     """
 
-    def __init__(self, quant_config: GPTQConfig):
+    def __init__(self, quant_config: GPTQConfig, prefix):
+        self.prefix = prefix
+        self.tp_size = get_tensor_model_parallel_world_size()
         super().__init__(quant_config)
 
     def create_weights(
@@ -351,10 +354,9 @@ class SophGPTQLinearMethod(GPTQLinearMethod):
         adjusted_input_size = input_size_per_partition // pack_factor
         adjusted_output_size = output_size_per_partition // pack_factor
 
-        layer_class_name = layer.__class__.__name__
-        is_attention = "SophQKVParallelLinear" in layer_class_name or "SophRowParallelLinear" in layer_class_name 
-        is_mlp_gate_up = "ColumnParallelLinear" in layer_class_name 
-        is_mlp_down = "RowParallelLinear" in layer_class_name
+        is_attention = "self_attn" in self.prefix
+        is_mlp_gate_up = ("mlp.gate_proj" in self.prefix ) or ("mlp.up_proj" in self.prefix)
+        is_mlp_down = "mlp.down_proj" in self.prefix
 
         if is_attention:
             qweight_shape = (output_size_per_partition, adjusted_input_size)
@@ -362,26 +364,50 @@ class SophGPTQLinearMethod(GPTQLinearMethod):
                             scale_and_zero_size//2  # After transposition, every 4 bits in the column direction are packed into 8 bits.
                             )
             scales_shape = (output_size_per_partition, scale_and_zero_size * int(16 // 8))
-            scale_dtype = torch.uint8               
+            scale_dtype = torch.uint8
+            input_dim=1
+            output_dim=0
         elif is_mlp_down:
-            effective_group_size = group_size // (torch.iinfo(torch.int32).bits // 8) # 128/(32/8) = 32
-            qweight_shape = (adjusted_input_size // group_size, output_size_per_partition * group_size)
-            qzeros_shape = (scale_and_zero_size // pack_factor, output_size_per_partition)
-            scales_shape = (scale_and_zero_size, output_size_per_partition)
+            # down_qweight
+            size = adjusted_input_size * self.tp_size // group_size
+            n_align = self.tp_size
+            block_size = self._compute_block_size(size, n_align)
+            qweight_shape = (block_size, output_size_per_partition * group_size)
+
+            # down_qzeros
+            size = scale_and_zero_size * self.tp_size // pack_factor
+            n_align = self.tp_size
+            block_size = self._compute_block_size(size, n_align)
+            qzeros_shape = (block_size, output_size_per_partition)
+
+            # down_scales
+            size = scale_and_zero_size * self.tp_size
+            n_align = self.tp_size * 2
+            block_size = self._compute_block_size(size, n_align)
+            scales_shape = (block_size, output_size_per_partition)
+
             scale_dtype = params_dtype
+            input_dim = 0
+            output_dim = 1
         elif is_mlp_gate_up:
-            qweight_shape = (output_size_per_partition, adjusted_input_size)
-            qzeros_shape = (output_size_per_partition, scale_and_zero_size // pack_factor)
-            scales_shape = (output_size_per_partition, scale_and_zero_size)
+            size = output_size_per_partition * self.tp_size
+            n_align = self.tp_size*256
+            block_size = self._compute_block_size(size, n_align)
+
+            qweight_shape = (block_size, adjusted_input_size)
+            qzeros_shape = (block_size, scale_and_zero_size // pack_factor)
+            scales_shape = (block_size, scale_and_zero_size)
             scale_dtype = params_dtype
+            input_dim=1
+            output_dim=0
 
         qweight = PackedvLLMParameter(
             data=torch.empty(
                 qweight_shape, 
                 dtype=torch.uint8
             ),
-            input_dim=0,
-            output_dim=0,
+            input_dim=input_dim,
+            output_dim=output_dim,
             packed_dim=1,
             packed_factor=self.quant_config.pack_factor,
             weight_loader=weight_loader)
@@ -414,21 +440,21 @@ class SophGPTQLinearMethod(GPTQLinearMethod):
             weight_loader
         }
         if scale_and_zero_input_dim is None:
-            scales = ChannelQuantScaleParameter(output_dim=0,
+            scales = ChannelQuantScaleParameter(output_dim=output_dim,
                                                 **weight_scale_args)
             qzeros = PackedColumnParameter(
-                output_dim=0,
+                output_dim=output_dim,
                 packed_dim=1,
                 packed_factor=self.quant_config.pack_factor,
                 **qzeros_args)
 
         else:
-            scales = GroupQuantScaleParameter(output_dim=0,
-                                              input_dim=0,
+            scales = GroupQuantScaleParameter(output_dim=output_dim,
+                                              input_dim=input_dim,
                                               **weight_scale_args)
             qzeros = PackedvLLMParameter(
-                input_dim=0,
-                output_dim=0,
+                input_dim=input_dim,
+                output_dim=output_dim,
                 packed_dim=1,
                 packed_factor=self.quant_config.pack_factor,
                 **qzeros_args)
@@ -441,7 +467,7 @@ class SophGPTQLinearMethod(GPTQLinearMethod):
         layer.exllama_state = exllama_state
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        if type(layer).__name__ in ['SophQKVParallelLinear', 'SophRowParallelLinear']:
+        if "self_attn" in self.prefix:
             layer.scales.data = torch.cat((layer.scales.data, layer.qzeros.data),dim=-1).contiguous()
 
     def apply(self,
@@ -459,4 +485,12 @@ class SophGPTQLinearMethod(GPTQLinearMethod):
             self.quant_config.weight_bits,
             output_gptq,
         )
-        return output_gptq   
+        return output_gptq
+
+    def _compute_block_size(self, size: int, n_align: int) -> int:
+        new_size = (size + n_align - 1) // n_align * n_align
+        n_pad = new_size - size
+        if n_pad > 0:
+            size = new_size
+        block_size = (size + self.tp_size - 1) // self.tp_size
+        return block_size

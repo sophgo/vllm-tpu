@@ -467,7 +467,7 @@ class LlamaModel(nn.Module):
             self.mlp_buffer = torch.empty_like(hidden_states)
         # {MM-QKV output, Attention output, Attention_FC output}
             self.attn_buffer = []
-            self.attn_buffer.append(hidden_states.new_empty(hidden_states.shape[0], (self.num_heads + 2 * self.num_kv_heads) * self.head_dim))
+            self.attn_buffer.append(hidden_states.new_empty(hidden_states.shape[0], (self.num_heads + 2 * self.num_kv_heads) * self.head_dim // self.tp_size))
             self.attn_buffer.append(hidden_states.new_empty((hidden_states.shape[0], self.num_heads // self.tp_size, self.head_dim)))
             self.attn_buffer.append(torch.empty_like(hidden_states))
             self.rms_buffer = torch.empty_like(hidden_states)
@@ -523,6 +523,10 @@ class LlamaModel(nn.Module):
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
+        name_flags_1 = ["up_proj", "gate_proj", "down_proj"]
+        name_flags_2 = [".qweight", ".qzeros", ".scales"]
+        do_resize_list = [a + b for a in name_flags_1 for b in name_flags_2]
+    
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
@@ -539,6 +543,25 @@ class LlamaModel(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(scale_name)
                 continue
+            elif any(do_resize_name in name for do_resize_name in do_resize_list):
+                param = params_dict[name]
+                if 'down_proj' in name:
+                    dim_ = getattr(param, "input_dim", 0)
+                else:
+                    dim_ = getattr(param, "output_dim", 0) 
+                tp_rank = get_tensor_model_parallel_rank()
+                shard_size = getattr(param, "data", None).shape[dim_]
+                n_pad = shard_size* self.tp_size - loaded_weight.shape[dim_]
+                if (tp_rank == self.tp_size - 1) and (n_pad > 0):
+                    if dim_ == 0:
+                        loaded_weight = torch.nn.functional.pad(loaded_weight, (0,0,0,n_pad), 'constant', 0).contiguous()
+                    elif dim_ == 1:
+                        loaded_weight = torch.nn.functional.pad(loaded_weight, (0,n_pad,0,0), 'constant', 0).contiguous()
+                    else:
+                        raise NotImplementedError("Let's make that generic when needed")       
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                weight_loader(param, loaded_weight)
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
