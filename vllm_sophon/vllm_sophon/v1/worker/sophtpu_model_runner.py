@@ -20,14 +20,15 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.sampling_params import SamplingType
 from vllm.utils import LayerBlockType, cdiv, is_pin_memory_available, get_dtype_size
-from vllm.attention.backends.sophtpu_attn import (SophTPUAttentionBackend,
-                                                  SophTPUMetadata)
 from vllm.sequence import IntermediateTensors
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+
+from vllm_sophon.attention.attention import (SophTPUAttentionBackend,
+                                             SophTPUMetadata)
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
