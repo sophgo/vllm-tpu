@@ -257,7 +257,7 @@ def test_whole_model(
             torch_tpu.tpu.optimer_utils.OpTimer_reset()
 
         # sampling_params & prompts
-        sampling_params = SamplingParams(max_tokens=DECODE_TOKEN_LEN, temperature=0)
+        sampling_params = SamplingParams(max_tokens=DECODE_TOKEN_LEN, temperature=0, ignore_eos=True)
         if sampling_params is None:
             sampling_params = get_default_sampling_params(llm_engine)
 
