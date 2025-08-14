@@ -1,4 +1,5 @@
 import torch
+from collections import Counter as cCounter
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed
@@ -10,6 +11,8 @@ import math
 import sys
 import argparse
 from transformers import AutoTokenizer
+import json
+from datetime import datetime
 
 from vllm.platforms.sophtpu import get_soph_config_manager
 from vllm.logger import init_logger
@@ -46,6 +49,11 @@ parser.add_argument("--path", type=str, default="/data/", help="Path to model di
 parser.add_argument("--mode", type=str, default="chat", choices=["chat", "generation"], help="Run with chat mode or generation mode")
 parser.add_argument("--useV1", type=bool, default=True, help="Use vLLM V1. Set False to use V0.")
 parser.add_argument("--tp_size", type=int, default=1, help="Tensor Parallel size. Set to 1 to disable tensor parallel.")
+parser.add_argument(
+    "--save-json",
+    type=str,
+    help="Save outputs to specified file in json format.",
+)
 args = parser.parse_args()
 
 RANK = int(os.environ.get("OMPI_COMM_WORLD_RANK", "0"))
@@ -172,6 +180,7 @@ def validate_and_add_requests(
         prompts = [prompts]
     request_counter = Counter()
     # Add requests to the engine.
+    input_text = {}
     for i, prompt in enumerate(prompts):
         request_id = str(next(request_counter))
         llm_engine.add_request(
@@ -183,6 +192,8 @@ def validate_and_add_requests(
             prompt_adapter_request=prompt_adapter_request,
             priority=priority[i] if priority else 0,
         )
+        input_text[request_id] = prompt
+    return input_text
 
 def qwen_chat_wrapper(question):
     return f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n"
@@ -259,22 +270,28 @@ def test_whole_model(
     llm_engine, prompts = default_llm_engine(model_id, quantize, model_path, use_v1, tp_size, batches)
     import torch_tpu
 
+    # 初始化返回值变量 - Initialize return value variables
+    FTL_ms = 0.0
+    TPS = 0.0
+    quality_results = []
+
     for it in range(2):
         if it > 0:
             time.sleep(2)
             torch_tpu.tpu.optimer_utils.OpTimer_reset()
 
+        generated_tokens_len = cCounter()
         # sampling_params & prompts
         sampling_params = SamplingParams(max_tokens=DECODE_TOKEN_LEN, temperature=0, ignore_eos=True)
         if sampling_params is None:
             sampling_params = get_default_sampling_params(llm_engine)
 
         # Add requests to llm_engine Obj
-        validate_and_add_requests(
+        input_text = validate_and_add_requests(
             llm_engine=llm_engine,
             prompts=prompts,
             params=sampling_params,)
-        
+
         previous_texts = {}
         generated_text = {}
         time_list = []
@@ -283,7 +300,7 @@ def test_whole_model(
             if it > 0 and enable_profile and step_counter >= profile_starting_token:
                 torch.ops.my_ops.enable_profile(max_record_num, book_keeping)
             os.environ["TOKEN_IDX"] = str(step_counter)
-            
+
             generate_start = time.time_ns()
             generations = llm_engine.step()
             generate_end = time.time_ns()
@@ -301,6 +318,9 @@ def test_whole_model(
                 else:
                     generated_text[request_id] += new_text
 
+                # 统计生成的token数量 - Count generated tokens
+                generated_tokens_len[int(request_id)] += 1
+
                 previous_texts[request_id] = current_text
                 new_texts_log.append(new_text)
 
@@ -308,7 +328,7 @@ def test_whole_model(
                 logger.info(f'Token {step_counter} {[text for text in new_texts_log]}')
             step_counter += 1
 
-        #Generation finished，abort all request and reset KVcache
+        # Generation finished，abort all request and reset KVcache
         if llm_engine.has_unfinished_requests():
             reqs_to_abort= [g.request_id for g in generations]
             llm_engine.abort_request(reqs_to_abort)
@@ -318,17 +338,64 @@ def test_whole_model(
             torch_tpu.tpu.optimer_utils.OpTimer_dump()
             torch.ops.my_ops.disable_profile()
 
+        TPS = batches / np.mean(time_list[1:]) * 1000**3
+        FTL_ms = time_list[0] / 1000**2
+        TTFT = time_list[0] / 1000**3
+        TPOT = np.mean(time_list[1:]) / 1000**3
+        Throughput = batches / TPOT * 1000**3
         for key in generated_text.keys():
             logger.info(f"rank: {RANK}, Batch {key}: {repr(generated_text[key])}\n")
-        logger.warning(
-            f"FTL: {time_list[0] / 1000**2:.1f}ms, TPS: {batches / np.mean(time_list[1:]) * 1000**3:.1f}"
-        )
+        logger.warning(f"FTL: {FTL_ms:.1f}ms, TPS: {TPS:.1f}")
         logger.warning(f'TTFT: {time_list[0] /1000**3:.3f}s, TPOT: {np.mean(time_list[1:]) /1000**3:.3f}s, Throughput: {batches / np.mean(time_list[1:]) *1000**3:.1f}, TPS: {1/ np.mean(time_list[1:]) *1000**3:.1f}')
         logger.info(f"-----------------------------")
+
+    # 质量检查处理 - Quality check processing
+    quality_results = []  # 保持为空列表 - Keep as empty list
+
     del llm_engine
+    input_tokens_len = {k: len(v) for k, v in input_text.items()}
+    # 返回与test_model.py对齐的结果 - Return results aligned with test_model.py
+    return input_text, generated_text, input_tokens_len, dict(generated_tokens_len), FTL_ms, TPS, quality_results
+
+def collect_meta(args):
+    from torch_tpu.utils.collect_env import collect_cpu_performance,pretty_version_info
+    from torch_tpu.tpu.versions import versions
+    import traceback
+    
+    try:
+        torch_version_info = pretty_version_info()
+    except Exception as e:
+        logger.error(f"Failed to collect torch version info: {e}")
+        torch_version_info = traceback.format_exc()
+
+    return {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "cpu": collect_cpu_performance(),
+        "tpu": versions(),
+        "torch": torch_version_info,
+        "sys_env": dict(os.environ),
+        "vllm": {
+            "v1": args.useV1,
+            "exec_file": os.path.abspath(__file__),
+        }
+    }
 
 if __name__ == "__main__":
-    test_whole_model(
+    if args.save_json == 'auto':
+        abs_dir = os.path.join('/record/vllm_results', datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
+        os.makedirs(abs_dir, exist_ok=True)
+        assert os.access(abs_dir, os.W_OK), f"Permission denied: {abs_dir}"
+
+    meta = collect_meta(args)
+    (
+        input_text,
+        generated_text,
+        real_input_len,
+        real_output_len,
+        FTL_ms,
+        TPS,
+        quality_results,
+    ) = test_whole_model(
         batches=args.batch,
         model_id=args.model,
         quantize=args.quantize,
@@ -337,3 +404,51 @@ if __name__ == "__main__":
         use_v1 = args.useV1,
         tp_size = args.tp_size,
     )
+    
+    # 保存JSON结果 - Save JSON results
+    if args.save_json:
+        # 确保目录存在 - Ensure directory exists
+        if args.save_json == 'auto':
+            file_name = f"{args.model_id}_{args.dtype}_{args.batch}_{args.input_length}_{args.max_new_tokens}_{args.mode}_{RANK}.json"
+            abs_dir = os.path.join('/record/vllm_results', datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
+            os.makedirs(abs_dir, exist_ok=True)
+            args.save_json = os.path.join(abs_dir, file_name)
+        else:
+            os.makedirs(os.path.dirname(os.path.abspath(args.save_json)), exist_ok=True)
+        
+        # 构建保存的数据结构 - Build data structure to save
+        json_data = {
+            "schema_version": "v2",
+            "benchmark": {
+                "model": args.model,
+                "quantize": args.quantize,
+                "batch_size": args.batch,
+                "max_new_tokens": DECODE_TOKEN_LEN,
+                "context_len": CONTEXT_LEN,
+                "mode": args.mode,
+                "tp_size": args.tp_size,
+            },
+            "meta": meta,
+            "performance": {
+                "FTL_ms": FTL_ms,
+                "TPS": TPS,
+            },
+            "quality": quality_results,
+            "data": {
+                "text_input": input_text,
+                "text_generated": generated_text,
+                "real_input_len": real_input_len,
+                "real_output_len": real_output_len,
+            }
+        }
+        
+        # 保存到文件，添加rank后缀 - Save to file with rank suffix
+        output_file = f"{args.save_json}_{RANK}.json"
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(
+                json_data,
+                f,
+                ensure_ascii=False,
+                indent=4,
+            )
+        logger.info(f"Results saved to {output_file}")
