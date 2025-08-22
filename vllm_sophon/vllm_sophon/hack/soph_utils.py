@@ -141,7 +141,8 @@ def weight_reorder(model_id, quantize, dtype, groupsize):
     from vllm.distributed import get_tensor_model_parallel_rank
     if quantize in ["gptq", 'awq']:
         tp_rank = get_tensor_model_parallel_rank()
-        reorder_path = f"{model_id}-reorder"
+        reorder_cache_pth = os.path.join('/data', '.reorder_cache')
+        reorder_path = os.path.join(reorder_cache_pth, model_id.rstrip('/').split('/')[-1])
         if not os.path.exists(reorder_path) and tp_rank == 0:
             logger.warning(f"Start weight reorder process...")
             copy_files(model_id, reorder_path, ".safetensors")
