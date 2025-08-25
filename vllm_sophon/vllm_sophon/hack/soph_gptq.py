@@ -1,8 +1,11 @@
 from typing import Any, Dict, List, Optional, Union
 import torch
+from copy import deepcopy
 from vllm.config import QuantizationConfig
 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.quantization.gptq import GPTQConfig, ExllamaState
+from vllm.model_executor.layers.quantization.gptq import GPTQConfig, ExllamaState, GPTQLinearMethod
+from vllm.model_executor.layers.linear import (LinearBase,
+                                               UnquantizedLinearMethod)
 from vllm.model_executor.layers.vocab_parallel_embedding import (ParallelLMHead,
                                                                  UnquantizedEmbeddingMethod)
 from vllm.model_executor.layers.quantization.utils.gptq_utils import (override_config,
