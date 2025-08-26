@@ -60,7 +60,6 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader,
                                               make_layers,
                                               maybe_prefix)
 
-from vllm.platforms import current_platform
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
