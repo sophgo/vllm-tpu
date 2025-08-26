@@ -196,6 +196,12 @@ class SophTPUModelRunner:
         # Used to initialize positions / context_lens / seq_lens
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int32)
 
+        self.query_start_loc_cpu = torch.zeros(self.max_num_reqs + 1,
+                                               dtype=torch.int32,
+                                               device="cpu",
+                                               pin_memory=self.pin_memory)
+        self.query_start_loc_np = self.query_start_loc_cpu.numpy()
+
         self.time_records = {
             "inference": [],
             "data_transfer": []
@@ -550,6 +556,31 @@ class SophTPUModelRunner:
         self._update_states(scheduler_output)
         pd_info = self._get_prompts_and_decodes(scheduler_output)
 
+        req_ids = pd_info.prompt_req_ids + pd_info.decode_req_ids
+
+        num_reqs = self.input_batch.num_reqs
+        assert(num_reqs == len(req_ids))
+        num_scheduled_tokens = np.empty(num_reqs, dtype=np.int32)
+        max_num_scheduled_tokens = 0
+        for i, req_id in enumerate(req_ids):
+            req_index = self.input_batch.req_id_to_index[req_id]
+            if req_id in pd_info.prompt_req_ids:
+                num_tokens = pd_info.prompt_scheduled_tokens[req_index]
+            else:
+                assert req_id in pd_info.decode_req_ids
+                num_tokens = 1
+            num_scheduled_tokens[i] = num_tokens
+            max_num_scheduled_tokens = max(max_num_scheduled_tokens,
+                                           num_tokens)
+
+        cu_num_tokens = np.cumsum(num_scheduled_tokens)
+
+        self.query_start_loc_np[0] = 0
+        self.query_start_loc_np[1:num_reqs + 1] = cu_num_tokens
+        query_start_loc = self.query_start_loc_cpu[:num_reqs + 1].to(
+            self.device, non_blocking=True)
+        logits_indices = query_start_loc[1:] - 1
+
         num_prompts = len(pd_info.prompt_req_ids)
         sampled_token_ids = [0] * self.input_batch.num_reqs
 
@@ -561,9 +592,11 @@ class SophTPUModelRunner:
             # mixed batch sequential execution (prompt first, then decode)
             decode_hidden = self._run_model(decode_batch, intermediate_tensors)
             prompt_hidden = self._run_model(prompt_batch, intermediate_tensors)
-            hidden_or_intermediate_states = torch.cat([prompt_hidden, decode_hidden], dim=0)
+            sample_prompt_hidden = prompt_hidden[logits_indices]
+            hidden_or_intermediate_states = torch.cat([sample_prompt_hidden, decode_hidden], dim=0)
         elif prompt_batch:
             hidden_or_intermediate_states = self._run_model(prompt_batch, intermediate_tensors)
+            hidden_or_intermediate_states = hidden_or_intermediate_states[logits_indices]
         elif decode_batch:
             hidden_or_intermediate_states = self._run_model(decode_batch, intermediate_tensors)
         else:
@@ -581,7 +614,6 @@ class SophTPUModelRunner:
         generate_token_ids_list = generate_token_ids_cpu.tolist()
 
         # Update cached state
-        req_ids = pd_info.prompt_req_ids + pd_info.decode_req_ids
         for i, req_id in enumerate(req_ids):
             req_index = self.input_batch.req_id_to_index[req_id]
             req_state = self.requests[req_id]
@@ -590,8 +622,7 @@ class SophTPUModelRunner:
 
             # batch with prefill-chunking
             if is_prefill and req_state.num_computed_tokens < len(req_state.prompt_token_ids):
-                generate_token_index_ = sum(pd_info.prompt_scheduled_tokens[:i+1])
-                token_id = generate_token_ids_list[generate_token_index_-1]
+                token_id = generate_token_ids_list[i]
                 # Determine whether prefill-chunking is complete
                 num_prefill_tokens_remained = len(req_state.prompt_token_ids)-req_state.num_computed_tokens
                 if num_prefill_tokens_remained <= self.max_num_tokens:
@@ -599,8 +630,7 @@ class SophTPUModelRunner:
                     req_state.output_token_ids.append(token_id)
             elif num_prompts > 0:
                 # decode in mixed batch
-                generate_token_index_all_prompt = sum(pd_info.prompt_scheduled_tokens[:i+1])
-                token_id = generate_token_ids_list[i - num_prompts + generate_token_index_all_prompt]
+                token_id = generate_token_ids_list[i]
                 req_state.output_token_ids.append(token_id)
             else:
                 # decode
