@@ -565,7 +565,8 @@ class SophTPUModelRunner:
         for i, req_id in enumerate(req_ids):
             req_index = self.input_batch.req_id_to_index[req_id]
             if req_id in pd_info.prompt_req_ids:
-                num_tokens = pd_info.prompt_scheduled_tokens[req_index]
+                prompt_scheduled_tokens_index = pd_info.prompt_req_ids.index(req_id)
+                num_tokens = pd_info.prompt_scheduled_tokens[prompt_scheduled_tokens_index]
             else:
                 assert req_id in pd_info.decode_req_ids
                 num_tokens = 1
