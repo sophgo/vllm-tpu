@@ -28,11 +28,13 @@ class UniProcExecutor(ExecutorBase):
         distributed_init_method = get_distributed_init_method(
             get_ip(), get_open_port())
         local_rank = 0
-        # set local rank as the device index if specified
-        device_info = self.vllm_config.device_config.device.__str__().split(
-            ":")
-        if len(device_info) > 1:
-            local_rank = int(device_info[1])
+        from vllm.platforms import current_platform
+        if not current_platform.is_sophtpu():
+            # set local rank as the device index if specified
+            device_info = self.vllm_config.device_config.device.__str__().split(
+                ":")
+            if len(device_info) > 1:
+                local_rank = int(device_info[1])
         rank = 0
         kwargs = dict(
             vllm_config=self.vllm_config,
