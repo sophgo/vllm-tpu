@@ -7,7 +7,6 @@ import logging
 import os, time
 import numpy as np
 import math
-# import sccl
 import sys
 import argparse
 from transformers import AutoTokenizer
@@ -15,6 +14,7 @@ import json
 from datetime import datetime
 
 from vllm.platforms.sophtpu import get_soph_config_manager
+# from vllm_sophon.platform import get_soph_config_manager
 from vllm.logger import init_logger
 from vllm.engine.llm_engine import LLMEngine
 from vllm.usage.usage_lib import UsageContext
@@ -34,7 +34,7 @@ parser.add_argument(
     default="qwen2-7b",
     # required=True,
     choices=["llama2-7b", "llama3.1-8b", "llama3.1-70b", "qwen2.5-32b", "qwen2.5-14b", "qwen2.5-7b","qwen2-7b", "qwen2-72b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwen3-8b", "qwen3-235b-a22b",
-             "qwq", "deepseek_v2", "deepseek_v3"],
+             "qwq", "deepseek_v2", "deepseek_v3", "llava_next"],
     help="Model name to test (e.g., llama2-7b, llama3.1-8b, llama3.1-70b, qwen2.5-32b, qwen2.5-14b, qwen2-7b, qwen2-57b-a14b, qwen3-32b, qwq, qwen3-8b, deepseek_v2, deepseek_v3)",
 )
 parser.add_argument(
@@ -69,6 +69,7 @@ if os.path.exists(log_file):
 soph_config_manager = get_soph_config_manager()
 DECODE_TOKEN_LEN = soph_config_manager.get('DECODE_TOKEN_LEN')
 CONTEXT_LEN = soph_config_manager.get('CONTEXT_LEN')
+MAX_IMG_TOKEN = soph_config_manager.get('MAX_IMG_TOKEN')
 
 def default_llm_engine(model, quantize, path, use_v1, tp_size, batches):
     model_configs = {
@@ -99,7 +100,7 @@ def default_llm_engine(model, quantize, path, use_v1, tp_size, batches):
         "qwen2-72b": {
             "gptq": {"model_id": "Qwen2-72B-Instruct-GPTQ-Int4","dtype": "float16"},
             "default": {"model_id": "Qwen2-72B-Instruct", "dtype": "bfloat16"}
-        },        
+        },
         "qwen2-57b-a14b": {
             "gptq": {"model_id": "Qwen2-57B-A14B-Instruct-GPTQ-Int4","dtype": "float16"},
             "default": {"model_id": "Qwen2-57B-A14B-Instruct", "dtype": "bfloat16"}
@@ -132,6 +133,9 @@ def default_llm_engine(model, quantize, path, use_v1, tp_size, batches):
             "gptq": {"model_id": "DeepSeek-V3", "dtype": "bfloat16"},
             "default": {"model_id": "DeepSeek-V3", "dtype": "bfloat16"},
         },
+        "llava_next": {
+            "default": {"model_id": "llava-v1.6-vicuna-7b", "dtype": "float16"},
+        },
     }
 
     model_info = model_configs.get(model, {}).get(quantize, model_configs.get(model, {}).get("default"))
@@ -139,9 +143,9 @@ def default_llm_engine(model, quantize, path, use_v1, tp_size, batches):
         raise ValueError(f"Unsupported model or quantization: {model}, {quantize}")
     model_id = os.path.join(path, model_info["model_id"])
 
-    prompts, num_prompts_total_tokens = defatult_multi_batch_prompt(model_id, batches)
+    prompts, num_prompts_total_tokens = defatult_multi_batch_prompt(model, model_id, batches)
     soph_config_manager.config['CURRENT_BATCH_SIZE'] = batches
-    max_model_len = DECODE_TOKEN_LEN + math.ceil(num_prompts_total_tokens / batches) # max_len per (prompot+decodes)
+    max_model_len = get_max_model_len(model, batches, num_prompts_total_tokens)
 
     dtype = model_info["dtype"]
 
@@ -217,6 +221,7 @@ def deepseek_chat_wrapper(question):
 llama_models = ["llama2-7b", "llama3.1-8b", "llama3.1-70b"]
 qwen_models = ["qwen2.5-32b", "qwen2.5-14b", "qwen2-7b","qwen2-72b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwq", "qwen3-8b", "qwen3-235b-a22b"]
 deepseek_models = ["deepseek_v2", "deepseek_v3"]
+multimodal_models = ["llava_next", "qwen2_vl", "qwen2_5_vl"]
 # decide the chat wrapper by model type
 CHAT_WRAPPER = {model: llama_chat_wrapper for model in llama_models}
 CHAT_WRAPPER.update({model: qwen_chat_wrapper for model in qwen_models})
@@ -229,7 +234,7 @@ CHAT_WRAPPER_TOKEN_NUM = {model: llama_wrapper_token for model in llama_models}
 CHAT_WRAPPER_TOKEN_NUM.update({model: qwen_wrapper_token for model in qwen_models})
 CHAT_WRAPPER_TOKEN_NUM.update({model: deepseek_wrapper_token for model in deepseek_models})
 
-def defatult_multi_batch_prompt(model_id, num_request, mode="chat"):
+def gen_test_batch_prompt(model_id, num_request, mode="chat"):
     if os.path.exists('questions.txt'):
         with open('questions.txt', 'r', encoding='utf-8') as f:
             questions = [line.strip() for line in f.readlines() if line.strip() and not line.startswith('#')]
@@ -266,6 +271,65 @@ def defatult_multi_batch_prompt(model_id, num_request, mode="chat"):
             total_tokens += len(tokens)
 
     return prompts, total_tokens
+
+def gen_vlm_test_batch_prompt(model_id, batch_size):
+    def prepare_image(img_pth):
+        if not os.path.exists(img_pth):
+            try:
+                import requests as rq
+                os.makedirs(os.path.dirname(img_pth), exist_ok=True)
+                response = rq.get("https://raw.githubusercontent.com/huggingface/text-generation-inference/main/integration-tests/images/chicken_on_money.png")
+                response.raise_for_status()
+                with open(img_pth, 'wb') as f:
+                    f.write(response.content)
+                logger.info(f"Input image does not exist, automatically downloading test image and saved to {img_pth}")
+            except Exception as e:
+                logger.error(f"Failed to download image: {e}")
+
+    def gen_batch_pb(batch_size, img_pth):
+        prompt_header = "A chat between a curious human and an artificial intelligence assistant. \
+                        The assistant gives helpful, detailed, and polite answers to the human's questions. USER: ![]("
+        question = "<image>What is shown in this image?ASSISTANT:"
+        input_str = f"{prompt_header}{question}"
+
+        from PIL import Image
+        image = Image.open(img_pth)
+        prompt = [{
+                "prompt": input_str,
+                "multi_modal_data": {"image": image},
+            } for _ in range(batch_size)]
+
+        prompt = cast(Union[PromptType, Sequence[PromptType]], prompt)
+        logger.info(f'Real input text: {prompt}')
+
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        if tokenizer:
+            tokens = tokenizer.encode(input_str, add_special_tokens=False)
+        num_prompts_total_tokens = len(tokens) * batch_size
+
+        return prompt, num_prompts_total_tokens
+
+    img_pth = "dataset/images/chicken_on_money.png"
+    prepare_image(img_pth)
+    batch_pb, num_prompts_total_tokens = gen_batch_pb(batch_size, img_pth)
+
+    return batch_pb, num_prompts_total_tokens
+
+def defatult_multi_batch_prompt(model, model_id, batches):
+    if model in multimodal_models:
+        prompts, num_prompts_total_tokens = gen_vlm_test_batch_prompt(model_id, batches)
+    else:
+        prompts, num_prompts_total_tokens = gen_test_batch_prompt(model_id, batches)
+    return prompts, num_prompts_total_tokens
+
+def get_max_model_len(model, batches, num_prompts_total_tokens):
+    if model in multimodal_models:
+        max_model_len = DECODE_TOKEN_LEN + math.ceil(num_prompts_total_tokens / batches) + MAX_IMG_TOKEN
+        return max_model_len
+    else:
+        max_model_len = DECODE_TOKEN_LEN + math.ceil(num_prompts_total_tokens / batches) # max_len per (prompot+decodes)
+        return max_model_len
 
 def test_whole_model(
     batches=1, model_id="llama", model_path="/data", quantize=None, mode="chat", use_v1=True, tp_size=2
@@ -370,7 +434,7 @@ def collect_meta(args):
     from torch_tpu.utils.collect_env import collect_cpu_performance,pretty_version_info
     from torch_tpu.tpu.versions import versions
     import traceback
-    
+
     try:
         torch_version_info = pretty_version_info()
     except Exception as e:
@@ -413,7 +477,7 @@ if __name__ == "__main__":
         use_v1 = args.useV1,
         tp_size = args.tp_size,
     )
-    
+
     # 保存JSON结果 - Save JSON results
     if args.save_json:
         # 确保目录存在 - Ensure directory exists
@@ -424,7 +488,7 @@ if __name__ == "__main__":
             args.save_json = os.path.join(abs_dir, file_name)
         else:
             os.makedirs(os.path.dirname(os.path.abspath(args.save_json)), exist_ok=True)
-        
+
         # 构建保存的数据结构 - Build data structure to save
         json_data = {
             "schema_version": "v2",
@@ -450,7 +514,7 @@ if __name__ == "__main__":
                 "real_output_len": real_output_len,
             }
         }
-        
+
         # 保存到文件，添加rank后缀 - Save to file with rank suffix
         output_file = f"{args.save_json}_{RANK}.json"
         with open(output_file, "w", encoding="utf-8") as f:

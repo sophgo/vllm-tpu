@@ -12,6 +12,7 @@ from transformers.configuration_utils import PretrainedConfig
 
 from vllm.engine import llm_engine
 from vllm.platforms.sophtpu import get_soph_config_manager
+# from vllm_sophon.platform import get_soph_config_manager
 from vllm.logger import init_logger
 from vllm.engine.llm_engine import LLMEngine
 from vllm.usage.usage_lib import UsageContext
@@ -22,6 +23,7 @@ from vllm.inputs import PromptType
 from vllm.pooling_params import PoolingParams
 from vllm.utils import Counter
 from vllm.sophtpu_utils import LLMQualityChecker
+# from vllm_sophon.hack.soph_utils import LLMQualityChecker
 
 logger = init_logger(__name__)
 
@@ -34,6 +36,7 @@ soph_config_manager = get_soph_config_manager()
 MAX_IMG_TOKEN = soph_config_manager.get('MAX_IMG_TOKEN')
 ENABLE_PROFILE = soph_config_manager.get('ENABLE_PROFILE')
 BOOK_KEEPING = soph_config_manager.get('PROFILE_BOOK_KEEPING')
+DECODE_TOKEN_LEN = soph_config_manager.get('DECODE_TOKEN_LEN')
 
 log_file = f"{os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))}/run_local_{RANK}.log"
 if os.path.exists(log_file):
@@ -123,7 +126,10 @@ def apply_chat_template(question):
     ]
     return messages
 
-def default_llm_engine(model_id, dtype, use_v1, max_new_tokens, input_length, tp_size):
+def default_llm_engine(model_id, is_multi_modal, dtype, use_v1, max_new_tokens, input_length, tp_size):
+    if is_multi_modal:
+        input_length = input_length + MAX_IMG_TOKEN
+
     engine_args = EngineArgs(
         model=model_id,
         dtype=dtype,
@@ -167,23 +173,27 @@ def validate_and_add_requests(
         # Convert a single prompt to a list.
         prompts = [prompts]
 
-    tokenizer = llm_engine.tokenizer.tokenizer
+    is_multi_modal = any("multi_modal_data" in p for p in prompts)
+    if not is_multi_modal:
+        tokenizer = llm_engine.tokenizer.tokenizer
 
-    if llm_engine.tokenizer.tokenizer.chat_template is None:
-        # Define a simple chat template for models like LLaMA.
-        llama_template = """{% for message in messages %}{% if message['role'] == 'user' %}<s>[INST] {{ message['content'] }} [/INST]{% elif message['role'] == 'assistant' %}{{ message['content'] }}</s>{% endif %}{% endfor %}"""
-        tokenizer.chat_template = llama_template
-    if chat_mode:
-        # Apply chat template if in chat mode.
-        prompts = [tokenizer.apply_chat_template(apply_chat_template(text), tokenize=False) for text in prompts]
+        if llm_engine.tokenizer.tokenizer.chat_template is None:
+            # Define a simple chat template for models like LLaMA.
+            llama_template = """{% for message in messages %}{% if message['role'] == 'user' %}<s>[INST] {{ message['content'] }} [/INST]{% elif message['role'] == 'assistant' %}{{ message['content'] }}</s>{% endif %}{% endfor %}"""
+            tokenizer.chat_template = llama_template
+        if chat_mode:
+            # Apply chat template if in chat mode.
+            prompts = [tokenizer.apply_chat_template(apply_chat_template(text), tokenize=False) for text in prompts]
 
-    # Truncate prompts
-    tokenizer.truncation_side = "left" if chat_mode else "right"
-    truncated_prompts = []
-    for prompt in prompts:
-        tokens = tokenizer.encode(prompt, max_length=input_length, truncation=True)
-        truncated_text = tokenizer.decode(tokens, skip_special_tokens=True)
-        truncated_prompts.append(truncated_text)
+        # Truncate prompts
+        tokenizer.truncation_side = "left" if chat_mode else "right"
+        truncated_prompts = []
+        for prompt in prompts:
+            tokens = tokenizer.encode(prompt, max_length=input_length, truncation=True)
+            truncated_text = tokenizer.decode(tokens, skip_special_tokens=True)
+            truncated_prompts.append(truncated_text)
+    else:
+        truncated_prompts = prompts
 
     request_counter = Counter()
     # Add requests to the engine.
@@ -223,28 +233,75 @@ def gen_test_case(batch_size, chat: False):
 
     return questions
 
-def gen_vlm_test_batch(
-    model, batch_size, input_length, max_new_tokens, chat_mode
-):
-    pass
+def gen_vlm_test_batch(batch_size):
+    def prepare_image(img_pth):
+        if not os.path.exists(img_pth):
+            try:
+                import requests as rq
+                os.makedirs(os.path.dirname(img_pth), exist_ok=True)
+                response = rq.get("https://raw.githubusercontent.com/huggingface/text-generation-inference/main/integration-tests/images/chicken_on_money.png")
+                response.raise_for_status()
+                with open(img_pth, 'wb') as f:
+                    f.write(response.content)
+                logger.info(f"Input image does not exist, automatically downloading test image and saved to {img_pth}")
+            except Exception as e:
+                logger.error(f"Failed to download image: {e}")
+
+
+    def gen_batch_pb(batch_size, img_pth):
+        prompt_header = "A chat between a curious human and an artificial intelligence assistant. \
+                        The assistant gives helpful, detailed, and polite answers to the human's questions. USER: ![]("
+
+        question = "<image>What is shown in this image?ASSISTANT:"
+        input_str = f"{prompt_header}{question}"
+
+        from PIL import Image
+        image = Image.open(img_pth)
+        prompt = [{
+                "prompt": input_str,
+                "multi_modal_data": {"image": image},
+            } for _ in range(batch_size)]
+
+        prompt = cast(Union[PromptType, Sequence[PromptType]], prompt)
+        logger.info(f'Real input text: {prompt}')
+
+        return prompt
+
+    img_pth = "dataset/images/chicken_on_money.png"
+    prepare_image(img_pth)
+    batch_pb = gen_batch_pb(batch_size, img_pth)
+
+    return batch_pb
+
+def init_batch_prompt(is_multi_modal, batches, chat_mode):
+    if is_multi_modal:
+        next_batch = gen_vlm_test_batch(batches)
+    else:
+        next_batch = gen_test_case(batches, chat_mode)
+    return next_batch
 
 def test_whole_model(
     model_id, dtype, batch, input_length, max_new_tokens, chat_mode:bool = False, quality_check:bool = False,
     use_v1:bool = True, tp_size:int=1
-):  
+):
     prof = None
     profile_starting_token = soph_config_manager.get("PROFILE_STARTING_TOKEN")
     soph_config_manager.config['CURRENT_BATCH_SIZE'] = batch
 
+    config_dict, _ = PretrainedConfig.get_config_dict(model_id)
+    model_type = config_dict.get("model_type", None)
+    is_multi_modal = model_type in {"llava_next", "qwen2_vl", "qwen2_5_vl"}
+
     llm_engine = default_llm_engine(
-        model_id=model_id, dtype=dtype, use_v1=use_v1, 
+        model_id=model_id, is_multi_modal=is_multi_modal, dtype=dtype, use_v1=use_v1, 
         max_new_tokens=max_new_tokens, input_length=input_length, tp_size=tp_size
     )
-    prompts = gen_test_case(batch, chat_mode)
+
+    prompts = init_batch_prompt(is_multi_modal, batch, chat_mode)
 
     for repeat_i in range(2):
         logger.warning(f'================================ Run iter: {repeat_i + 1} ================================')
-        
+
         # sampling_params & prompts
         sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=0, ignore_eos=True)
         if sampling_params is None:

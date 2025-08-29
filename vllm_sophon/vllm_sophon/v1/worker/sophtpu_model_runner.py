@@ -7,7 +7,6 @@ import time
 
 import numpy as np
 import torch
-import torch.distributed
 import torch.nn as nn
 import torch_tpu
 
@@ -29,6 +28,11 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_sophon.attention.attention import (SophTPUAttentionBackend,
                                              SophTPUMetadata)
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import (MultiModalKwargs, PlaceholderRange)
+from vllm.multimodal.utils import group_mm_inputs_by_modality
+from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
+from vllm_sophon.hack.soph_utils import sanity_check_mm_encoder_outputs
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import SchedulerOutput
@@ -129,6 +133,18 @@ class SophTPUModelRunner:
 
         self.model: Optional[nn.Module] = None
 
+        # Multi-modal data support
+        self.uses_mrope = model_config.uses_mrope
+        # TODO: Support M-RoPE (e.g, Qwen2-VL)
+        assert not self.uses_mrope, "TPU does not support M-RoPE yet."
+
+        encoder_compute_budget, encoder_cache_size = compute_encoder_budget(
+            model_config=model_config,
+            scheduler_config=scheduler_config,
+        )
+        self.max_num_encoder_input_tokens = encoder_compute_budget
+        self.encoder_cache_size = encoder_cache_size
+
         # Persistent batch.
         self.input_batch = InputBatch(
             max_num_reqs=self.max_num_reqs,
@@ -193,6 +209,37 @@ class SophTPUModelRunner:
             self.decode_context_lens_np.append(
                 self.decode_context_lens_cpu[-1].numpy())
 
+        # Get maximum number of mm items per modality (batch size).
+        self.max_num_mm_items_by_modality = dict()
+        if (self.is_multimodal_model and self.max_num_encoder_input_tokens > 0
+                and self.encoder_cache_size > 0):
+            max_tokens_by_modality_dict = (
+                MULTIMODAL_REGISTRY.
+                get_max_tokens_per_item_by_nonzero_modality(self.model_config))
+            for modality, max_tokens in max_tokens_by_modality_dict.items():
+                # Check how many items of this modality can be supported by
+                # the encoder budget.
+                encoder_budget = min(self.max_num_encoder_input_tokens,
+                                     self.encoder_cache_size)
+
+                max_num_mm_items_encoder_budget = cdiv(encoder_budget,
+                                                       max_tokens)
+
+                # Check how many items of this modality can be supported by
+                # the decoder budget.
+                max_mm_items_per_req = MULTIMODAL_REGISTRY.\
+                    get_mm_limits_per_prompt(self.model_config)[modality]
+
+                # NOTE: We do not consider max_num_batched_tokens on purpose
+                # because the multimodal embeddings can be generated in advance
+                # and chunked prefilled.
+                max_num_mm_items_decoder_budget = self.max_num_reqs * \
+                    max_mm_items_per_req
+
+                max_num_mm_items = min(max_num_mm_items_encoder_budget,
+                                       max_num_mm_items_decoder_budget)
+                self.max_num_mm_items_by_modality[modality] = max_num_mm_items
+
         # Range tensor with values [0 .. self.max_num_tokens - 1].
         # Used to initialize positions / context_lens / seq_lens
         self.arange_np = np.arange(self.max_num_tokens, dtype=np.int32)
@@ -208,6 +255,7 @@ class SophTPUModelRunner:
             "data_transfer": []
         }
         self.num_tokens = 0
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> bool:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -370,6 +418,135 @@ class SophTPUModelRunner:
                     f"Unknown attention type: {attn_module.attn_type}")
 
         return kv_cache_spec
+
+    def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
+        scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+        if not scheduled_encoder_inputs:
+            return
+
+        # Batch the multi-modal inputs.
+        mm_inputs = list[MultiModalKwargs]()
+        req_ids_pos = list[tuple[str, int, PlaceholderRange]]()
+        for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
+            req_state = self.requests[req_id]
+
+            for mm_input_id in encoder_input_ids:
+                mm_inputs.append(req_state.mm_inputs[mm_input_id])
+                req_ids_pos.append(
+                    (req_id, mm_input_id, req_state.mm_positions[mm_input_id]))
+
+        # Batch mm inputs as much as we can: if a request in the batch has
+        # multiple modalities or a different modality than the previous one,
+        # we process it separately to preserve item order.
+        # FIXME(ywang96): This is a hacky way to deal with multiple modalities
+        # in the same batch while still being able to benefit from batching
+        # multimodal inputs. The proper solution should be reordering the
+        # encoder outputs.
+        grouped_mm_inputs_list = group_mm_inputs_by_modality(mm_inputs)
+        encoder_outputs = []
+        for grouped_mm_inputs in grouped_mm_inputs_list:
+            batched_mm_inputs = MultiModalKwargs.batch(grouped_mm_inputs)
+            batched_mm_inputs['image_sizes'] = batched_mm_inputs['image_sizes'].to(dtype=torch.int32)
+            batched_mm_inputs = MultiModalKwargs.as_kwargs(
+                batched_mm_inputs,
+                device=self.device,
+            )
+
+            # Run the encoder.
+            # `curr_group_outputs` is either of the following:
+            # 1. A tensor of shape (num_items, feature_size, hidden_size)
+            # in case feature_size is fixed across all multimodal items.
+            # 2. A list or tuple (length: num_items) of tensors, each of shape
+            # (feature_size, hidden_size) in case the feature size is dynamic
+            # depending on the input multimodal items.
+            curr_group_outputs = self.model.get_multimodal_embeddings(
+                **batched_mm_inputs)
+
+            sanity_check_mm_encoder_outputs(
+                curr_group_outputs,
+                expected_num_items=len(grouped_mm_inputs),
+            )
+
+            if isinstance(curr_group_outputs, torch.Tensor):
+                encoder_outputs.append(curr_group_outputs)
+            else:
+                assert isinstance(curr_group_outputs, (list, tuple))
+                for output in curr_group_outputs:
+                    encoder_outputs.append(output)
+
+        # Cache the encoder outputs.
+        # NOTE (NickLucche) here we diverge from logic in other runners, as we
+        # assume to only have whole mm items to process. Hence we avoid the
+        # intrinsic dynamism that `scatter_mm_placeholders` introduces.
+        # print(f"req_ids_pos:{req_ids_pos}, encoder_outputs:{encoder_outputs}")
+        for (req_id, input_id, pos_info), output in zip(
+                req_ids_pos,
+                encoder_outputs,
+        ):
+            if req_id not in self.encoder_cache:
+                self.encoder_cache[req_id] = {}
+            self.encoder_cache[req_id][input_id] = output
+
+    def _gather_mm_embeddings(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> list[torch.Tensor]:
+        mm_embeds: list[torch.Tensor] = []
+        for req_id in self.input_batch.req_ids:
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens[
+                req_id]
+            req_state = self.requests[req_id]
+            num_computed_tokens = req_state.num_computed_tokens
+            mm_positions = req_state.mm_positions
+            # TODO unroll loop and assume/enforce --disable_chunked_mm_input
+            # NOTE (NickLucche) here we diverge from logic in other runners, as
+            # we assume to only have whole mm items to process. Hence we avoid
+            # the intrinsic dynamism that `gather_mm_placeholders` introduces.
+            for i, pos_info in enumerate(mm_positions):
+                start_pos = pos_info["offset"]
+                num_encoder_tokens = pos_info["length"]
+
+                # The encoder output is needed if the two ranges overlap:
+                # [num_computed_tokens,
+                #  num_computed_tokens + num_scheduled_tokens) and
+                # [start_pos, start_pos + num_encoder_tokens)
+                if start_pos >= num_computed_tokens + num_scheduled_tokens:
+                    # The encoder output is not needed in this step.
+                    break
+                if start_pos + num_encoder_tokens <= num_computed_tokens:
+                    # The encoder output is already processed and stored
+                    # in the decoder's KV cache.
+                    continue
+
+                start_idx = max(num_computed_tokens - start_pos, 0)
+                end_idx = min(
+                    num_computed_tokens - start_pos + num_scheduled_tokens,
+                    num_encoder_tokens)
+                assert start_idx < end_idx
+                assert req_id in self.encoder_cache
+                assert i in self.encoder_cache[req_id]
+                encoder_output = self.encoder_cache[req_id][i]
+                mm_embeds.append(encoder_output[start_idx:end_idx])
+        return mm_embeds
+
+    def _get_model_inputs(self, input_ids: torch.Tensor,
+                          mm_embeds: list[torch.Tensor]):
+        if self.is_multimodal_model:
+            # NOTE(woosuk): To unify token ids and soft tokens (vision
+            # embeddings), we always use embeddings (rather than token ids)
+            # as input to the multimodal model, even when the input is text.
+            if mm_embeds:
+                inputs_embeds = self.model.get_input_embeddings(
+                    input_ids, mm_embeds)
+            else:
+                inputs_embeds = self.model.get_input_embeddings(input_ids)
+            return inputs_embeds
+        else:
+            # For text-only models, we use token ids as input.
+            # While it is possible to use embeddings as input just like the
+            # multimodal models, it is not desirable for performance since
+            # then the embedding layer is not included in the CUDA graph.
+            return None
 
     def _get_prompts_and_decodes(
         self,
@@ -590,15 +767,25 @@ class SophTPUModelRunner:
         prompt_batch = self._prepare_prompt(pd_info) if pd_info.prompt_req_ids else None
         decode_batch = self._prepare_decode(pd_info.decode_req_ids) if pd_info.decode_req_ids else None
 
+        if self.is_multimodal_model:
+            # Run the multimodal encoder if any.
+            self._execute_mm_encoder(scheduler_output)
+            mm_embeds = self._gather_mm_embeddings(scheduler_output)
+        else:
+            mm_embeds = []
+
+        if prompt_batch:
+            inputs_embeds = self._get_model_inputs(prompt_batch.input_tokens, mm_embeds)
+
         hidden_or_intermediate_states = None
         if prompt_batch and decode_batch:
             # mixed batch sequential execution (prompt first, then decode)
             decode_hidden = self._run_model(decode_batch, intermediate_tensors)
-            prompt_hidden = self._run_model(prompt_batch, intermediate_tensors)
+            prompt_hidden = self._run_model(prompt_batch, intermediate_tensors, inputs_embeds)
             sample_prompt_hidden = prompt_hidden[logits_indices]
             hidden_or_intermediate_states = torch.cat([sample_prompt_hidden, decode_hidden], dim=0)
         elif prompt_batch:
-            hidden_or_intermediate_states = self._run_model(prompt_batch, intermediate_tensors)
+            hidden_or_intermediate_states = self._run_model(prompt_batch, intermediate_tensors, inputs_embeds)
             hidden_or_intermediate_states = hidden_or_intermediate_states[logits_indices]
         elif decode_batch:
             hidden_or_intermediate_states = self._run_model(decode_batch, intermediate_tensors)
@@ -613,6 +800,7 @@ class SophTPUModelRunner:
         argmax_token_ids = argmax_token_ids.squeeze(dim=-1)
         # Transfer sampled tokens from TPU to CPU.
         generate_token_ids_cpu = argmax_token_ids.cpu()
+
         # self._statistics_time(t1, t2, t3, t4)
         generate_token_ids_list = generate_token_ids_cpu.tolist()
 
@@ -659,7 +847,7 @@ class SophTPUModelRunner:
             prompt_logprobs_dict={req_id: None for req_id in req_ids},
         )
 
-    def _run_model(self, model_input, intermediate_tensors):
+    def _run_model(self, model_input, intermediate_tensors, inputs_embeds=None):
         with set_forward_context(model_input.attn_metadata, self.vllm_config):
             return self.model(
                 input_ids=model_input.input_tokens,
@@ -667,6 +855,7 @@ class SophTPUModelRunner:
                 kv_caches=self.kv_caches,
                 attn_metadata=model_input.attn_metadata,
                 intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
             )
 
     def load_model(self) -> None:
@@ -759,10 +948,22 @@ class SophTPUModelRunner:
                 context_lens=context_lens,
             )
 
+        if self.is_multimodal_model:
+            inputs_embeds = torch.zeros((num_tokens, self.hidden_size),
+                                        dtype=self.dtype,
+                                        device=self.device)
+        else:
+            inputs_embeds = None
+
         with set_forward_context(attn_metadata, self.vllm_config, 0):
             assert self.model is not None
-            self.model(token_ids, position_ids, attn_metadata, kv_caches)
-
+            self.model(
+                token_ids,
+                position_ids,
+                kv_caches,
+                attn_metadata,
+                inputs_embeds=inputs_embeds,
+            )
 
     def capture_model(self) -> None:
         """Compile the model."""
@@ -934,6 +1135,7 @@ class ModelWrapperV1(nn.Module):
         position_ids: torch.Tensor,
         attn_metadata: AttentionMetadata,
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Executes the forward pass of the model and samples the next token.
 
@@ -975,6 +1177,7 @@ class ModelWrapperV1(nn.Module):
             position_ids,
             kv_caches,
             attn_metadata,
+            inputs_embeds=inputs_embeds,
         )
 
         hidden_states = hidden_states.flatten(0, 1)

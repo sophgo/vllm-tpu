@@ -272,13 +272,19 @@ bash emulate_4_users.sh
 #### 测试 LLaMA-7B 模型:
 
   ```shell
-  python test_whole_model.py --model /data/llama-2-7b-chat-hf/
+  python test_whole_model.py --model llama2-7b
+  ```
+
+#### 生成模式下测试多模态 LLaVA-Next 模型:
+
+  ```shell
+  python test_whole_model.py --model llava_next --max-new-tokens=20 --mode generate
   ```
 
 #### 测试多芯并行推理结果:
 
   ```shell
-  CHIP_MAP=0,1 test_whole_model.py --model /data/llama-2-7b-chat-hf/ --batch 4 --tp_size 2
+  CHIP_MAP=0,1 test_whole_model.py --model llama2-7b --batch 4 --tp_size 2
   ```
 
   CHIP_MAP=0,1：环境变量CHIP_MAP用于指定分布式推理需要使用的芯片编号。

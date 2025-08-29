@@ -306,7 +306,6 @@ def flatten_bn(
 
     return [x_n for x_b in x for x_n in x_b]
 
-
 def _flatten_embeddings(embeddings: NestedTensors) -> torch.Tensor:
     """
     Recursively flattens and concatenates NestedTensors on all but the last
@@ -347,7 +346,6 @@ def merge_multimodal_embeddings_from_map(
     inputs_embeds[placeholder_map.dest] = flattened_embeddings[
         placeholder_map.src]
     return inputs_embeds
-
 
 def _merge_multimodal_embeddings(
     inputs_embeds: torch.Tensor,

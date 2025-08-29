@@ -17,3 +17,7 @@ def register_model():
     ModelRegistry.register_model(
         "Qwen3ForCausalLM",
         "vllm_sophon.models.soph_qwen3:Qwen3ForCausalLM")
+
+    ModelRegistry.register_model(
+        "LlavaNextForConditionalGeneration",
+        "vllm_sophon.models.soph_llava_next:LlavaNextForConditionalGeneration")

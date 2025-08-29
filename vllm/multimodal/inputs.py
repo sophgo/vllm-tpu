@@ -653,8 +653,10 @@ class MultiModalKwargs(UserDict[str, NestedTensors]):
     ) -> BatchedTensorInputs:
         json_inputs = cast(JSONTree[torch.Tensor], batched_inputs)
 
+        from vllm.platforms import current_platform
+        non_blocking = not current_platform.is_sophtpu()
         json_mapped = json_map_leaves(
-            lambda x: x.to(device, non_blocking=True),
+            lambda x: x.to(device, non_blocking=non_blocking),
             json_inputs,
         )
 
