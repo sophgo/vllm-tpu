@@ -565,8 +565,7 @@ class SophTPUModelRunner:
         for i, req_id in enumerate(req_ids):
             req_index = self.input_batch.req_id_to_index[req_id]
             if req_id in pd_info.prompt_req_ids:
-                prompt_scheduled_tokens_index = pd_info.prompt_req_ids.index(req_id)
-                num_tokens = pd_info.prompt_scheduled_tokens[prompt_scheduled_tokens_index]
+                num_tokens = scheduler_output.num_scheduled_tokens.get(str(req_index))
             else:
                 assert req_id in pd_info.decode_req_ids
                 num_tokens = 1
@@ -581,6 +580,8 @@ class SophTPUModelRunner:
         query_start_loc = self.query_start_loc_cpu[:num_reqs + 1].to(
             self.device, non_blocking=True)
         logits_indices = query_start_loc[1:] - 1
+        prompt_len = len(pd_info.prompt_req_ids)
+        logits_indices = logits_indices[:prompt_len]
 
         num_prompts = len(pd_info.prompt_req_ids)
         sampled_token_ids = [0] * self.input_batch.num_reqs
@@ -626,7 +627,8 @@ class SophTPUModelRunner:
                 token_id = generate_token_ids_list[i]
                 # Determine whether prefill-chunking is complete
                 num_prefill_tokens_remained = len(req_state.prompt_token_ids)-req_state.num_computed_tokens
-                if num_prefill_tokens_remained <= self.max_num_tokens:
+                num_scheduled_tokens = scheduler_output.num_scheduled_tokens.get(str(req_index))
+                if num_prefill_tokens_remained <= num_scheduled_tokens:
                     # end of prefill-chunking, generate the first token
                     req_state.output_token_ids.append(token_id)
             elif num_prompts > 0:

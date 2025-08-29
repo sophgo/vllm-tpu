@@ -100,19 +100,20 @@ class SophGPTQLinearMethod(GPTQLinearMethod):
         exllama_state = ExllamaState.UNINITIALIZED
         scale_and_zero_size = input_size // group_size
         scale_and_zero_input_dim = None
+
+        assert not self.quant_config.desc_act, (
+        "For GPTQ-quantized model inference on Soph_TPU, "
+        "models quantized with quant_config.desc_act=FALSE are required. ")
         if (input_size != input_size_per_partition
                 and self.quant_config.group_size != -1):
-            # For act-order models, we cannot use Exllama for row parallel layer
-            if self.quant_config.desc_act:
-                exllama_state = ExllamaState.UNUSED
-            else:
-                # we need to partition qzeros and scales for exllama kernel
-                scale_and_zero_size = input_size_per_partition // group_size
-                scale_and_zero_input_dim = 0
+            # we need to partition qzeros and scales for exllama kernel
+            scale_and_zero_size = input_size_per_partition // group_size
+            scale_and_zero_input_dim = 0
+
         """
         Adaptations cover three aspects:
         1. Shape
-        2. Dtype 
+        2. Dtype
         3. output_dim and packed_dim_qw
 
         The shape transformation logic follows the implementation in `weight_reorder()` method.
