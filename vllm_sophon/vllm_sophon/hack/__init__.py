@@ -5,3 +5,4 @@ import vllm_sophon.hack.sampling_metadata
 import vllm_sophon.hack.soph_gptq
 import vllm_sophon.hack.soph_utils
 import vllm_sophon.hack.uniproc_executor
+import vllm_sophon.hack.loggers
