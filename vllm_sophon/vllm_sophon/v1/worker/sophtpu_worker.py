@@ -22,6 +22,7 @@ from vllm.v1.utils import bind_kv_cache
 from vllm.distributed.parallel_state import _WORLD, init_world_group
 from vllm_sophon.platform import get_soph_config_manager
 from vllm_sophon.v1.worker.sophtpu_model_runner import ExecutionMode, SophTPUModelRunner
+import math
 
 logger = init_logger(__name__)
 
@@ -131,8 +132,11 @@ class SophTPUWorker:
         if batch_size is None:
             batch_size = 128
 
+        block_size = self.vllm_config.cache_config.block_size
         coef = 1 if self.model_config.use_mla else 2
-        kvcache_memory = coef * num_hidden_layers * batch_size * max_model_len * num_heads * head_dim * bytes_per_elem
+        kvcache_memory = coef * num_hidden_layers * batch_size * \
+                            math.ceil(max_model_len / block_size) * block_size * \
+                                num_heads * head_dim * bytes_per_elem
         kvcache_memory = kvcache_memory * 1.1  # Redundant memory
         return kvcache_memory
 
