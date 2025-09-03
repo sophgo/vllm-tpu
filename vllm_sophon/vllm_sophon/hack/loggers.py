@@ -4,6 +4,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import List
 
+from vllm.v1.metrics import loggers
 import vllm
 from vllm.v1.core.kv_cache_utils import PrefixCachingMetrics
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
