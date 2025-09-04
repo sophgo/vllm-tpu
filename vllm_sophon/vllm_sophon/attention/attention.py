@@ -7,6 +7,8 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionLayer,
                                               AttentionMetadata, AttentionType)
 from vllm.attention.backends.utils import CommonAttentionState
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
 class SophTPUAttentionBackend(AttentionBackend):
 
@@ -33,7 +35,7 @@ class SophTPUAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
     ) -> Tuple[int, ...]:
-        #return (num_kv_heads, num_blocks, block_size, head_size)
+        # return (num_kv_heads, num_blocks, block_size, head_size)
         return (num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -64,6 +66,12 @@ class SophTPUMetadata(AttentionMetadata):
     block_tables: Optional[torch.Tensor] = None
     input_lengths: Optional[torch.Tensor] = None
     cache_lengths: Optional[torch.Tensor] = None
+
+    # positional embeddings parameters
+    cos: Optional[torch.Tensor] = None
+    sin: Optional[torch.Tensor] = None
+    # buffers for storing the intermediate results of the attention computation
+    buffer: Optional[Dict[str, torch.Tensor]] = None
 
     @property
     def prefill_metadata(self) -> Optional["SophTPUMetadata"]:
@@ -97,7 +105,7 @@ class SophTPUAttentionBackendImpl(AttentionImpl):
         kv_cache_dtype: str,
         blocksparse_params: Optional[Dict[str, Any]] = None,
         logits_soft_cap: Optional[float] = None,
-        attn_type: str = AttentionType.DECODER,
+        attn_type: str = AttentionType.DECODER
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -110,7 +118,9 @@ class SophTPUAttentionBackendImpl(AttentionImpl):
         if alibi_slopes is not None:
             raise NotImplementedError("Alibi slopes is not supported.")
         if sliding_window is not None:
-            raise NotImplementedError("Sliding window is not supported.")
+            logger.warning("The context lengths must be less than sliding window.\
+                           This is temporarily method to support QwQ-32B.")
+            # raise NotImplementedError("Sliding window is not supported.")
         if kv_cache_dtype != "auto":
             raise NotImplementedError("FP8 KV cache dtype is not supported.")
         if blocksparse_params is not None:
@@ -128,8 +138,8 @@ class SophTPUAttentionBackendImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        kv_cache: Tuple[torch.Tensor, torch.Tensor],
-        attn_metadata: SophTPUMetadata,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with Sophon TPU attention.
@@ -140,10 +150,33 @@ class SophTPUAttentionBackendImpl(AttentionImpl):
             value: shape = [batch_size, seq_len, num_kv_heads * head_size]
             kv_cache[0] = [num_blocks, block_size, num_kv_head, head_size]
             kv_cache[1] = [num_blocks, block_size, num_kv_head, head_size]
-                NOTE: kv_cache[0] and kv_cache[1] will be an empty tensor 
+                NOTE: kv_cache[0] and kv_cache[1] will be an empty tensor
                 with shape [0] for profiling run.
             attn_metadata: Metadata for attention.
         Returns:
             shape = [batch_size, seq_len, num_heads * head_size]
         """
-        pass
+        context_lengths = attn_metadata.input_lengths + attn_metadata.cache_lengths
+        attn_output = attn_metadata.buffer['attn_out'] if output is None else output
+        torch.ops.my_ops.hybrid_attention(
+            attn_output,
+            torch.where(attn_metadata.input_lengths > 1)[0],
+            query,
+            key,
+            value,
+            kv_cache[0],
+            kv_cache[1],
+            attn_metadata.cos,
+            attn_metadata.sin,
+            attn_metadata.input_lengths,
+            attn_metadata.cache_lengths,
+            context_lengths,
+            attn_metadata.slot_mapping,
+            attn_metadata.block_tables,
+            None,
+            attn_metadata.block_tables.size(1),
+            context_lengths.max().item(),
+            kv_cache[0].size(1),
+            self.scale
+        )
+        return attn_output

@@ -35,7 +35,6 @@ from vllm.config import CacheConfig, VllmConfig, ParallelConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm_sophon.ops.soph_linear import (SophQKVParallelLinear,
                                          SophColumnParallelLinear,
                                          SophRowParallelLinear)
@@ -63,24 +62,12 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader,
 from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
+from vllm.model_executor.models.qwen2 import Qwen2Attention
 
 from vllm_sophon.ops.soph_embedding import SophEmbedding
+from vllm_sophon.ops.layernorm import SophonRMSNorm
 
 logger = init_logger(__name__)
-
-def soph_rmsnorm(weight, output, hidden_states, variance_epsilon, residual=None):
-    if residual is not None:
-        hidden_states += residual
-    residual = hidden_states
-    torch.ops.my_ops.rmsnorm_forward(
-        hidden_states,
-        weight,
-        None,
-        output,
-        hidden_states.dim() - 1,
-        variance_epsilon,
-    )
-    return residual
 
 class Qwen2MLP(nn.Module):
 
@@ -141,8 +128,7 @@ class Qwen2MLP(nn.Module):
             output = tensor_model_parallel_all_reduce(output)
         return output
 
-class Qwen2Attention(nn.Module):
-
+class SophonQwen2Attention(Qwen2Attention):
     def __init__(self,
                  hidden_size: int,
                  num_heads: int,
@@ -154,27 +140,9 @@ class Qwen2Attention(nn.Module):
                  rope_scaling: Optional[Tuple] = None,
                  prefix: str = "",
                  attn_type: str = AttentionType.DECODER) -> None:
-        super().__init__()
-        self.hidden_size = hidden_size
-        tp_size = get_tensor_model_parallel_world_size()
-        self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
-        self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            # Number of KV heads is greater than TP size, so we partition
-            # the KV heads across multiple tensor parallel GPUs.
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            # Number of KV heads is less than TP size, so we replicate
-            # the KV heads across multiple tensor parallel GPUs.
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        self.head_dim = hidden_size // self.total_num_heads
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
+        super().__init__(hidden_size, num_heads, num_kv_heads, max_position, \
+                         rope_theta, cache_config, quant_config, \
+                         rope_scaling, prefix, attn_type)
 
         self.qkv_proj = SophQKVParallelLinear(
             hidden_size,
@@ -193,55 +161,25 @@ class Qwen2Attention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position,
-            base=self.rope_theta,
-            rope_scaling=rope_scaling,
-        )
-
-        # SophTPU Attention may not need，just use native Attention to init metadata
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_kv_heads,
-                              cache_config=cache_config,
-                              quant_config=quant_config,
-                              prefix=f"{prefix}.attn",
-                              attn_type=attn_type)
-
     def forward(
         self,
         #positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        cos,
-        sin,
         kv_cache: torch.Tensor,
-        block_tables,
-        slots,
-        input_lengths,
-        cache_lengths,
-        prompt_lengths,
-        max_s,
-        mode_tensor,
-        mask,
-        attention_output: torch.Tensor,
+        attn_metadata: AttentionMetadata
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states, attention_output[0])
+        qkv, _ = self.qkv_proj(hidden_states, attn_metadata.buffer['qkv_proj_out'])
         query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         query = query.view(-1, self.num_heads, self.head_dim)
         key = key.view(-1, self.num_kv_heads, self.head_dim)
         value = value.view(-1, self.num_kv_heads, self.head_dim)
 
-        block_size = int(kv_cache[1].shape[1])
-        torch.ops.my_ops.hybrid_attention(attention_output[1], mode_tensor, query, key, value, kv_cache[0], kv_cache[1],
-                                        cos, sin, input_lengths, cache_lengths, prompt_lengths, slots, block_tables, mask,
-                                        block_tables.size(1), max_s, block_size, self.scaling)
+        attn_out = self.attn(query, key, value, kv_cache, attn_metadata)
 
         # Reshape the output tensor.
-        output, _ = self.o_proj(attention_output[1].view(-1, self.num_heads * self.head_dim), attention_output[2])
+        output, _ = self.o_proj(attn_out.view(-1, self.num_heads * self.head_dim), \
+                                attn_metadata.buffer['o_proj_out'])
 
         return output
 
@@ -270,7 +208,7 @@ class Qwen2DecoderLayer(nn.Module):
         else:
             attn_type = AttentionType.ENCODER_ONLY
 
-        self.self_attn = Qwen2Attention(
+        self.self_attn = SophonQwen2Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             max_position=config.max_position_embeddings,
@@ -289,87 +227,33 @@ class Qwen2DecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                eps=config.rms_norm_eps)
+        self.input_layernorm = SophonRMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
+        self.post_attention_layernorm = SophonRMSNorm(
+            hidden_size=config.hidden_size,
+            eps=config.rms_norm_eps,
+        )
 
-        self.eps = config.rms_norm_eps
-        self.input_layernorm_weight = self.input_layernorm.weight.data
-        self.post_attention_layernorm_weight = self.post_attention_layernorm.weight.data
-
-    #def forward(
-    #    self,
-    #    positions: torch.Tensor,
-    #    hidden_states: torch.Tensor,
-    #    kv_cache: torch.Tensor,
-    #    attn_metadata: AttentionMetadata,
-    #    residual: Optional[torch.Tensor],
     def forward(
         self,
         hidden_states: torch.Tensor,
         kv_cache: torch.Tensor,
-        block_tables,
-        slots,
-        input_lengths,
-        cache_lengths,
-        prompt_lengths,
-        max_s,
-        mode_tensor,
-        mask,
         residual: Optional[torch.Tensor],
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        attn_buffer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         mlp_buffer: torch.Tensor,
         rms_buffer: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
+        hidden_states, residual = self.input_layernorm(hidden_states, rms_buffer, residual)
 
-        """
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
-        )
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        attn_output = self.self_attn(hidden_states, kv_cache, attn_metadata)
 
-        return hidden_states, residual
+        hidden_states, residual = self.post_attention_layernorm(attn_output, rms_buffer, residual)
 
-        """
-        res = soph_rmsnorm(self.input_layernorm_weight, rms_buffer, hidden_states, self.eps, residual)
+        self.mlp(hidden_states, mlp_buffer)
 
-        attn_output = self.self_attn(
-            rms_buffer,
-            cos,
-            sin,
-            kv_cache,
-            block_tables,
-            slots,
-            input_lengths,
-            cache_lengths,
-            prompt_lengths,
-            max_s,
-            mode_tensor,
-            mask,
-            attn_buffer
-        )
-
-        attn_res = soph_rmsnorm(self.post_attention_layernorm_weight, rms_buffer, attn_output, self.eps, res)
-
-        self.mlp(rms_buffer, mlp_buffer)
-
-        return mlp_buffer, attn_res
+        return mlp_buffer, residual
 
 
 @support_torch_compile(
@@ -391,16 +275,15 @@ class Qwen2Model(nn.Module):
         quant_config = vllm_config.quant_config
 
         # TODO (@robertgshaw2): see if this can be moved out
-        if (cache_config.sliding_window is not None
-                and hasattr(config, "max_window_layers")):
-            raise ValueError("Sliding window for some but all layers is not "
-                             "supported. This model uses sliding window "
-                             "but `max_window_layers` = {} is less than "
-                             "`num_hidden_layers` = {}. Please open an issue "
-                             "to discuss this feature.".format(
-                                 config.max_window_layers,
-                                 config.num_hidden_layers,
-                             ))
+        if config.sliding_window is not None:
+            assert config.max_window_layers == config.num_hidden_layers, (
+                "Sliding window for some but all layers is not supported. "
+                "This model uses sliding window but `max_window_layers` = {} "
+                "is less than `num_hidden_layers` = {}. Please open an issue "
+                "to discuss this feature.".format(
+                    config.max_window_layers,
+                    config.num_hidden_layers,
+                ))
 
         self.config = config
         self.quant_config = quant_config
@@ -431,7 +314,7 @@ class Qwen2Model(nn.Module):
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = SophonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 
@@ -450,10 +333,8 @@ class Qwen2Model(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
 
         self.mlp_buffer = None
-        self.attn_buffer = None
         self.rms_buffer = None
 
-        self.eps = config.rms_norm_eps
         self.tp_size = get_tensor_model_parallel_world_size()
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -485,42 +366,28 @@ class Qwen2Model(nn.Module):
 
         if self.mlp_buffer is None or hidden_states.shape[0] != self.mlp_buffer.shape[0]:
             self.mlp_buffer = torch.empty_like(hidden_states)
-        # {MM-QKV output, Attention output, Attention_FC output}
-            self.attn_buffer = []
-            self.attn_buffer.append(hidden_states.new_empty(hidden_states.shape[0], (self.num_heads + 2 * self.num_kv_heads) * self.head_dim // self.tp_size,))
-            self.attn_buffer.append(hidden_states.new_empty((hidden_states.shape[0], self.num_heads // self.tp_size, self.head_dim)))
-            self.attn_buffer.append(torch.empty_like(hidden_states))
             self.rms_buffer = torch.empty_like(hidden_states)
         mlp_buffer = self.mlp_buffer
         rms_buffer = self.rms_buffer
-        attn_buffer = self.attn_buffer
 
-        block_tables = attn_metadata.block_tables
-        slots = attn_metadata.slot_mapping
-        input_lengths = attn_metadata.input_lengths
-        cache_lengths = attn_metadata.cache_lengths
-        prompt_lengths = input_lengths + cache_lengths
-        max_s = prompt_lengths.max().item()
-        mode_tensor = torch.where(input_lengths > 1)[0]
-        mask = None
+        seqlen = hidden_states.shape[0]
+        if attn_metadata.buffer is None or attn_metadata.buffer['attn_out'].shape[0] != seqlen:
+            attn_metadata.buffer = {}
+            attn_metadata.buffer['qkv_proj_out'] = \
+                hidden_states.new_empty(seqlen, (self.num_heads + 2 * self.num_kv_heads) * self.head_dim // self.tp_size)
+            attn_metadata.buffer['attn_out'] = \
+                hidden_states.new_empty(seqlen, self.num_heads // self.tp_size, self.head_dim)
+            attn_metadata.buffer['o_proj_out'] = torch.empty_like(hidden_states)
+        attn_metadata.cos = cos
+        attn_metadata.sin = sin
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 hidden_states,
                 kv_caches[i - self.start_layer],
-                block_tables,
-                slots,
-                input_lengths,
-                cache_lengths,
-                prompt_lengths,
-                max_s,
-                mode_tensor,
-                mask,
                 residual,
-                cos,
-                sin,
-                attn_buffer,
+                attn_metadata,
                 mlp_buffer,
                 rms_buffer,
             )
@@ -530,10 +397,8 @@ class Qwen2Model(nn.Module):
                 "hidden_states": hidden_states,
                 "residual": residual
             })
-        #hidden_states, _ = self.norm(hidden_states, residual)
-        soph_rmsnorm(self.norm.weight, rms_buffer, hidden_states, self.eps, residual)
-        #return hidden_states
-        return rms_buffer
+        hidden_states, _ = self.norm(hidden_states, rms_buffer, residual)
+        return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
@@ -570,7 +435,7 @@ class Qwen2Model(nn.Module):
                 if 'down_proj' in name:
                     dim_ = getattr(param, "input_dim", 0)
                 else:
-                    dim_ = getattr(param, "output_dim", 0) 
+                    dim_ = getattr(param, "output_dim", 0)
                 tp_rank = get_tensor_model_parallel_rank()
                 shard_size = getattr(param, "data", None).shape[dim_]
                 n_pad = shard_size* self.tp_size - loaded_weight.shape[dim_]
@@ -580,7 +445,7 @@ class Qwen2Model(nn.Module):
                     elif dim_ == 1:
                         loaded_weight = torch.nn.functional.pad(loaded_weight, (0,n_pad,0,0), 'constant', 0).contiguous()
                     else:
-                        raise NotImplementedError("Let's make that generic when needed")       
+                        raise NotImplementedError("Let's make that generic when needed")
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
