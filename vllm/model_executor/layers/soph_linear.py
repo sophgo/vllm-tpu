@@ -193,7 +193,7 @@ class SophColumnParallelLinear(ColumnParallelLinear):
             output = output_parallel
         output_bias = self.bias if self.skip_bias_add else None
         return output, output_bias
-    
+
     def process_weights_after_loading(self, *prefix):
         self.weight.data = soph_to_dtype(self.weight.data, self.params_dtype)
         if hasattr(self, 'weight_scale_inv') and self.weight_scale_inv is not None:

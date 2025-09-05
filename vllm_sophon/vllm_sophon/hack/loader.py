@@ -20,6 +20,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 
 from vllm_sophon.hack.soph_utils import weight_reorder
 from vllm_sophon.ops.soph_linear import SophRowParallelLinear, SophColumnParallelLinear, SophReplicatedLinear
+from vllm_sophon.ops.soph_fused_moe import SophDeepseekV3FusedMoE
 
 # hack for _process_weights_after_loading
 def _process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
@@ -45,11 +46,11 @@ def _process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
             # of process_weights_after_loading
             module.process_weights_after_loading(model_config.dtype)
 
-    if model_config.quantization is None:
+    if model_config.quantization not in ['gptq', 'awq']:
         for name, module in model.named_modules():
-            if isinstance(module, (SophRowParallelLinear, SophColumnParallelLinear, SophReplicatedLinear)):
-                # For all model weights used on SophTPU, perform type checking and conversion. 
-                # Transpose and make contiguous the weights of down_proj in mlp. 
+            if isinstance(module, (SophRowParallelLinear, SophColumnParallelLinear, SophReplicatedLinear, SophDeepseekV3FusedMoE)):
+                # For all model weights used on SophTPU, perform type checking and conversion.
+                # Transpose and make contiguous the weights of down_proj in mlp.
                 # The data types of embedding and norm are BF16, so they will not be modified for now.
                 module.process_weights_after_loading(name)
 

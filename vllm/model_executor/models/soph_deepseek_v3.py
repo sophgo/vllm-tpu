@@ -810,11 +810,6 @@ class DeepseekV3Model(torch.nn.Module):
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
-        
-        if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            self.norm = PPMissingLayer()
 
         self.num_heads = config.num_attention_heads
         self.hidden_size = config.hidden_size

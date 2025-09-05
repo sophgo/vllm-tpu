@@ -3,6 +3,8 @@ from typing import Optional, Tuple
 import torch
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding, RotaryEmbedding)
+from vllm.model_executor.layers.rotary_embedding import (
+    _yarn_find_correction_range, _yarn_linear_ramp_mask)
 
 def rope_forward_oot(
     self,
