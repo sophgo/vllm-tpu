@@ -316,8 +316,6 @@ class DefaultModelLoader(BaseModelLoader):
         if current_platform.is_sophtpu():
             hf_config = get_config(hf_folder, trust_remote_code = True) # Load the ​**config.json** file from a Hugging Face model directory
             quantization_config = getattr(hf_config, "quantization_config", None)
-            if hf_config.torch_dtype in (torch.float16, torch.float32):
-                hf_config.torch_dtype = torch.bfloat16
             if quantization_config:
                 reorder_id = weight_reorder(hf_folder, quantization_config.get('quant_method', None), hf_config.torch_dtype, quantization_config.get('group_size', None))
                 if reorder_id:

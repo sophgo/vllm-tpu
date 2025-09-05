@@ -100,12 +100,6 @@ class SophTpuPlatform(Platform):
         assert vllm_config.speculative_config is None, \
             "Sophon TPU does not support speculative decoding"
 
-        if vllm_config.model_config.dtype in (torch.float16, torch.float32):
-            logger.warning(
-                "The Sophon TPU backend currently does not support %s. "
-                "Using bfloat16 instead.", vllm_config.model_config.dtype)
-            vllm_config.model_config.dtype = torch.bfloat16
-
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
         if parallel_config.worker_cls == "auto":
