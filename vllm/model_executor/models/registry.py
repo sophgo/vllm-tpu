@@ -139,6 +139,7 @@ _EMBEDDING_MODELS = {
     #"Qwen2ForCausalLM": ("qwen2", "Qwen2ForCausalLM"),
     "Qwen2ForCausalLM": ("soph_qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": ("soph_qwen3", "Qwen3ForCausalLM"),
+    "Qwen3MoeForCausalLM": ("soph_qwen3_moe", "Qwen3MoeForCausalLM"),
     "Qwen2ForRewardModel": ("qwen2_rm", "Qwen2ForRewardModel"),
     "Qwen2ForProcessRewardModel": ("qwen2_rm", "Qwen2ForProcessRewardModel"),
     "TeleChat2ForCausalLM": ("telechat2", "TeleChat2ForCausalLM"),

@@ -35,7 +35,7 @@ parser.add_argument(
     default="qwen2-7b",
     # required=True,
     choices=["llama2-7b", "llama3.1-8b", "llama3.1-70b", "qwen2.5-32b", "qwen2.5-14b", "qwen2.5-7b","qwen2-7b", "qwen2-72b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwen3-8b", "qwen3-235b-a22b",
-             "qwq", "deepseek_v2", "deepseek_v3", "llava_next", "qwen2_vl", "qwen2_5_vl"],
+             "qwq", "deepseek_v2", "deepseek_v3", "llava_next", "qwen2_vl", "qwen2_5_vl", "qwen3-30b-a3b"],
     help="Model name to test (e.g., llama2-7b, llama3.1-8b, llama3.1-70b, qwen2.5-32b, qwen2.5-14b, qwen2-7b, qwen2-57b-a14b, qwen3-32b, qwq, qwen3-8b, deepseek_v2, deepseek_v3)",
 )
 parser.add_argument(
@@ -122,6 +122,10 @@ def default_llm_engine(model, quantize, path, use_v1, tp_size, batches):
             "gptq": {"model_id": "Qwen3-8B","dtype": "float16"},
             "default": {"model_id": "Qwen3-8B", "dtype": "bfloat16"}
         },
+        "qwen3-30b-a3b": {
+             "gptq": {"model_id": "Qwen3-30B-A3B","dtype": "bfloat16"},
+             "default": {"model_id": "Qwen3-30B-A3B", "dtype": "bfloat16"}
+         },
         "qwen3-235b-a22b": {
             "gptq": {"model_id": "Qwen3-235B-A22B","dtype": "float16"},
             "default": {"model_id": "Qwen3-235B-A22B", "dtype": "bfloat16"}
@@ -229,7 +233,7 @@ def deepseek_chat_wrapper(question):
 
 # group model by model structure
 llama_models = ["llama2-7b", "llama3.1-8b", "llama3.1-70b"]
-qwen_models = ["qwen2.5-32b", "qwen2.5-14b", "qwen2-7b","qwen2-72b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwq", "qwen3-8b", "qwen3-235b-a22b", "qwen2_vl", "qwen2_5_vl"]
+qwen_models = ["qwen2.5-32b", "qwen2.5-14b", "qwen2-7b","qwen2-72b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwq", "qwen3-8b", "qwen3-235b-a22b", "qwen3-30b-a3b", "qwen2_vl", "qwen2_5_vl"]
 deepseek_models = ["deepseek_v2", "deepseek_v3"]
 multimodal_models = ["llava_next", "qwen2_vl", "qwen2_5_vl"]
 # decide the chat wrapper by model type

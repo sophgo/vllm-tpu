@@ -25,3 +25,8 @@ def register_model():
     ModelRegistry.register_model(
         "Qwen2_5_VLForConditionalGeneration",
         "vllm_sophon.models.soph_qwen2_5_vl:Qwen2_5_VLForConditionalGeneration")
+
+    ModelRegistry.register_model(
+        "Qwen3MoeForCausalLM",
+        "vllm_sophon.models.soph_qwen3_moe:Qwen3MoeForCausalLM")
+

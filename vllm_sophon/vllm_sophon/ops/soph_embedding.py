@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
@@ -67,4 +66,50 @@ class SophEmbedding(torch.nn.Module):
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         param.data.copy_(loaded_weight)
 
+class SophParallelLMHead(SophEmbedding):
 
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        bias: bool = False,
+        params_dtype: Optional[torch.dtype] = None,
+        org_num_embeddings: Optional[int] = None,
+        padding_size: int = 128, 
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__(
+            num_embeddings=num_embeddings,
+            embedding_dim=embedding_dim,
+            params_dtype=params_dtype,
+            org_num_embeddings=org_num_embeddings,
+            padding_size=padding_size,
+            quant_config=quant_config,
+            prefix=prefix
+        )
+        self.bias = None
+        if bias:
+            self.bias = nn.Parameter(
+                torch.empty(num_embeddings, dtype=params_dtype)
+            )
+            set_weight_attrs(self.bias, {
+                "output_dim": 0,
+                "weight_loader": self.weight_loader
+            })
+        else:
+            if not hasattr(self, 'bias'):
+                self.register_parameter("bias", None)
+
+    def tie_weights(self, embed_tokens: SophEmbedding):
+        if self.quant_config and self.quant_config.get_name() == "gguf":
+            return embed_tokens
+        else:
+            self.weight = embed_tokens.weight
+            return self
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        output = super().forward(input_)
+        if self.bias is not None:
+            output += self.bias
+        return output
