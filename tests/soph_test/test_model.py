@@ -173,6 +173,7 @@ def validate_and_add_requests(
         # Convert a single prompt to a list.
         prompts = [prompts]
 
+    input_tokens_len = []
     is_multi_modal = any("multi_modal_data" in p for p in prompts)
     if not is_multi_modal:
         tokenizer = llm_engine.tokenizer.tokenizer
@@ -190,10 +191,15 @@ def validate_and_add_requests(
         truncated_prompts = []
         for prompt in prompts:
             tokens = tokenizer.encode(prompt, max_length=input_length, truncation=True)
+            input_tokens_len.append(len(tokens))
+
             truncated_text = tokenizer.decode(tokens, skip_special_tokens=True)
             truncated_prompts.append(truncated_text)
     else:
         truncated_prompts = prompts
+        for prompt in prompts:
+            tokens = tokenizer.encode(prompt)
+            input_tokens_len.append(len(tokens))
 
     request_counter = Counter()
     # Add requests to the engine.
@@ -210,7 +216,7 @@ def validate_and_add_requests(
             priority=priority[i] if priority else 0,
         )
         input_text[request_id] = prompt
-    return input_text
+    return input_text, input_tokens_len
 
 def gen_test_case(batch_size, chat: False):
     questions = []
@@ -308,14 +314,12 @@ def test_whole_model(
             sampling_params = get_default_sampling_params(llm_engine)
 
         # Add requests to llm_engine Obj
-        input_text = validate_and_add_requests(
+        input_text, input_tokens_len = validate_and_add_requests(
             llm_engine=llm_engine,
             prompts=prompts,
             params=sampling_params,
             chat_mode=chat_mode,
             input_length=input_length)
-
-        input_tokens_len = [len(b) for b in input_text.values()]
 
         previous_texts = {}
         generated_text = {}
