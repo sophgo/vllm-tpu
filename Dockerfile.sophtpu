@@ -37,7 +37,7 @@ RUN pip install -r requirements-sophtpu.txt \
 
 
 COPY vllm /workspace/vllm
-COPY tests/models/decoder_only/language/test_whole_model.py /workspace
+COPY tests/soph_test /workspace/tests/soph_test
 #RUN --mount=type=cache,target=/root/.cache/pip \
 #    --mount=type=cache,target=/root/.cache/ccache \
 #    --mount=type=bind,source=.git,target=.git \

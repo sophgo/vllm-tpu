@@ -77,7 +77,7 @@ def parse_args():
         type=str,
         choices=["chat", "generate"],
         default="generate",
-        help="Inference mode, chat or generate, defaults to chat.",
+        help="Inference mode, chat or generate, defaults to generate.",
     )
 
     parser.add_argument(

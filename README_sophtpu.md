@@ -13,9 +13,21 @@ vLLM项目代码、docker镜像、主要模型权重/数据集等资源在 FTP �
 |---------------|-------------|------------|
 | Llama2-7B     | FP16        | [Llama2-7B](https://huggingface.co/meta-llama/Llama-2-7b-hf) |
 | Llama2-7B     | w4a16       | [Llama-2-7B-Chat-GPTQ](https://huggingface.co/TheBloke/Llama-2-7B-Chat-GPTQ) |
+| Llama3.1-8B   | w4a16       | [Llama3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8b) |
+| Llama3.1-70B  | FP16        | [Llama3.1-70B](https://huggingface.co/meta-llama/Llama-3.1-70b) |
+| Llama3.1-70B  | w4a16       | [Llama-3.1-70B-Instruct-int4-auto-gptq](https://huggingface.co/sofya-ai/Meta-Llama-3.1-70B-Instruct-int4-auto-gptq) |
 | Qwen2-7B      | BF16        | [Qwen2-7B](https://huggingface.co/Qwen/Qwen2-7B) |
 | Qwen2-7B      | w4a16       | [Qwen2-7B](https://huggingface.co/Qwen/Qwen2-7B-Instruct-GPTQ-Int4) |
+| Qwen2-57B-A14B| BF16        | [Qwen2-57B-A14B-Instruct](https://huggingface.co/Qwen/Qwen2-57B-A14B-Instruct) |
 | Qwen2-72B     | w4a16       | [Qwen2-72B](https://huggingface.co/Qwen/Qwen2-72B) |
+| Qwen2.5-14B   | BF16        | [Qwen2.5-14B](https://huggingface.co/Qwen/Qwen2.5-14B-Instruct) |
+| QwQ-32B       | BF16        | [QwQ-32B](https://huggingface.co/Qwen/QwQ-32B) |
+| QwQ-32B       | w4a16       | [QwQ-32B-AWQ](https://huggingface.co/Qwen/QwQ-32B-AWQ) |
+| LLaVa-Next 7B | BF16        | [llava-v1.6-vicuna-7b](https://huggingface.co/liuhaotian/llava-v1.6-vicuna-7b) |
+| LLaVa-Next 13B| BF16        | [llava-v1.6-vicuna-13b-hf](https://huggingface.co/llava-hf/llava-v1.6-vicuna-13b-hf) |
+| Qwen2.5-VL 7B | BF16        | [Qwen2.5-VL-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) |
+| DeepSeek-V3   | FP8         | [DeepSeek-V3](https://huggingface.co/deepseek-ai/DeepSeek-V3)
+| DeepSeek-R1   | FP8         | [DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)
 
 **注释**：
 - `FP16` 和 `BF16` 均为16位浮点数格式，但具体编码方式不同。
@@ -102,6 +114,11 @@ docker run --privileged -td --restart always \
 1. Device推理时需要将device和runtime目录映射到docker容器内。
 2. c2c topo默认顺序为`0,1,2,3,4,5,6,7`，若实际topo和默认topo不一致，需要在创建docker时添加CHIP_MAP环境变量，如`-e CHIP_MAP=x,x,x,x`
 
+#### 启动docker容器
+```shell
+docker exec -it <CONTAINER_NAME> bash
+```
+
 #### 安装Torch-TPU whl包
 
 从FTP服务器上`torch_tpu/release_build/latest_release`目录下拉取torch-tpu whl包并安装：
@@ -129,36 +146,6 @@ export PYTHONPATH=path_to_vllm:path_to_vllm_sophon
    - 修改 `vllm/_custom_ops.py` 28行代码 `if TYPE_CHECKING:` 为 `if True:`，注册 `register_fake` 函数。
  - 上述事项只针对插件化功能，源码修改都是在官方 `vllm/vllm` 代码，而不是 `vLLM/vllm` 代码。
 
-## 启动模型推理服务
-
-### 启动docker容器
-
-```shell
-docker run --privileged -itd --restart always \
-    --name <CONTAINER_NAME> \
-    --shm-size 1g \
-    -p 8080:80 \
-    -v $(pwd):/workspace \
-    -v /dev/:/dev/ \
-    -v <DATA_PATH>:/data \
-    -v /opt/tpuv7:/opt/tpuv7 \
-    --entrypoint /bin/bash \
-    soph_vllm:0.7.3
-```
-
-### 进入docker容器
-
-```shell
-docker exec -it <CONTAINER_NAME> bash
-```
-
-### 安装Torch-TPU whl包
-从FTP服务器上`torch_tpu/release_build/latest_release`目录下拉取torch-tpu whl包,进入docker容器并安装：
-
-```shell
-tar -xvf torch-tpu_*.tar.gz
-pip install dist/torch_tpu-*_x86_64.whl --force-reinstall
-```
 
 ### 设置环境变量
 
@@ -257,34 +244,50 @@ bash emulate_4_users.sh
 
     ```shell
     docker exec -it <CONTAINER_NAME> bash
-    source soph_envsetup.sh
     ```
 
-### test_whole_model.py 单测脚本使用说明
+3. 安装Torch-TPU whl包
 
-`test_whole_model.py`脚本用于测试SOPH vLLM内LLM推理性能，相关参数如下：
-  - --model: 必需参数，指定要加载的模型的路径。
+    从FTP服务器上`torch_tpu/release_build/latest_release`目录下拉取torch-tpu whl包并安装：
+
+    ```shell
+    tar -xvf torch-tpu_*.tar.gz
+    pip install dist/torch_tpu-*_x86_64.whl --force-reinstall
+    ```
+
+### test_model.py 单测脚本使用说明
+
+`test_model.py`脚本用于测试SOPH vLLM内LLM推理性能，相关参数如下：
+  - --model-id: 必需参数，指定要加载的模型的路径。
+  - --dtype: 可选参数，指定模型运行时的数据类型。
   - --quantize: 可选参数，指定强制加载的模型的数据类型，quantize为true时尽量量化模型推理。
   - --batch: 可选参数，默认构造单测批次为1。
+  - --input-length: 可选参数，指定输入长度，默认128。
+  - --max-new_tokens: 可选参数，指定生成的结果长度，默认1024。
   - --tp_size: 可选参数，指定要推理的张量并行数量，默认为1。
   - --mode: 可选参数，指定运行模式，可选值为 chat 和 generate，默认值为 generate。
+  - --useV1: 可选参数，指定使用的vLLM Engine类型，默认使用vLLM V1 Engine。
+  - --save-results: 可选参数，是否保存性能结果到csv文件中。
+  - --quality-check: 可选参数，是否进行生成文本质量检测。
+  - --save-json: 可选参数，是否以json格式保存输出到文件
+
 
 #### 测试 LLaMA-7B 模型:
 
   ```shell
-  python test_whole_model.py --model llama2-7b
+  python3 test_model.py --model-id /data/llama-2-7b-chat-hf
   ```
 
 #### 生成模式下测试多模态 LLaVA-Next 模型:
 
   ```shell
-  python test_whole_model.py --model llava_next --max-new-tokens=20 --mode generate
+  python3 test_model.py --model-id /data/llava-v1.6-vicuna-7b --max-new-tokens=20 --mode generate
   ```
 
 #### 测试多芯并行推理结果:
 
   ```shell
-  CHIP_MAP=0,1 test_whole_model.py --model llama2-7b --batch 4 --tp_size 2
+  CHIP_MAP=0,1 test_model.py --model-id /data/llama-2-7b-chat-hf --batch 4 --tp_size 2
   ```
 
   CHIP_MAP=0,1：环境变量CHIP_MAP用于指定分布式推理需要使用的芯片编号。
@@ -295,29 +298,27 @@ bash emulate_4_users.sh
 #### 测试Llama2-7b推理性能
 
 ```shell
-CONTEXT_LEN=4096 DECODE_TOKEN_LEN=32 python test_whole_model.py --model llama2-7b --quantize gptq --batch 8
+python3 test_model.py --model-id /data/llama-2-7b-chat-hf --quantize gptq --batch 8 --input-length 4096 --max-new-tokens 128
 ```
 
 #### Qwen2-7b推理性能
 
 ```shell
-CONTEXT_LEN=4096 DECODE_TOKEN_LEN=32 python test_whole_model.py --model qwen2-7b --quantize gptq --batch 8
+python3 test_model.py --model-id /data/Qwen2-7B-Instruct --quantize gptq --batch 8 --input-length 4096 --max-new-tokens 128
 ```
-
-> 可通过`CONTEXT_LEN`指定上下文长度，通过`DECODE_TOKEN_LEN`指定最大生成的token数量。
 
 ### 测试Llama2-70b/Qwen2-72b模型推理性能
 
 #### 测试Llama2-70b推理性能
 
 ```shell
-CONTEXT_LEN=1024 DECODE_TOKEN_LEN=32 test_whole_model.py --model llama2-70b --batch 16 --tp_size 2
+python3 test_model.py --model-id /data/Llama-2-70b-chat-hf --batch 16 --input-length 1024 --max-new-tokens 128 --tp_size 2
 ```
 
 #### Qwen2-72b推理性能
 
 ```shell
-CONTEXT_LEN=512 DECODE_TOKEN_LEN=32 test_whole_model.py --model qwen2-72b --quantize gptq
+python3 test_model.py --model /data/Qwen2-72B-Instruct --quantize gptq --input-length 512 --max-new-tokens 128
 ```
 
 ### 性能测试注意事项
@@ -443,8 +444,6 @@ bash emulate_4_users_prefill_chunking.sh
 |-----------------------|---------------------------------------------------------|-------------------|
 | `DEVICE`              | 指定设备类型，`SOPHTPU`/`GPU`                           | `SOPHTPU`         |
 | `DISABLE_CACHE`       | 是否禁用指令缓存。`1` 禁用，`0` 启用。                  | `1`               |
-| `DECODE_TOKEN_LEN`    | 解码时生成的最大 token 数量。                           | `10`              |
-| `CONTEXT_LEN`         | 上下文长度，包括输入长度和解码长度。                    | `6`               |
 | `CMODEL_FAST_EXEC`    | 是否使用 oneDNN 加速 cmodel。                           | `OFF`             |
 | `OMP_NUM_THREADS`     | omp线程数量                                             |cpu thread         |
 | `WORLD_SIZE`          | 总进程数，用于分布式训练。                              | `1`               |
