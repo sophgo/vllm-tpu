@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
 import concurrent.futures
+from typing import List
 
 logger = init_logger(__name__)
 
@@ -98,9 +99,109 @@ def reorder_mlp_qzeros_down(tensor):
 
     return qzeros
 
-def gptq_reorder_kernel(out_tensors: list, dtype, name, file, groupsize):
+AWQ_PACK_ORDER = [0, 2, 4, 6, 1, 3, 5, 7]
+REVERSE_AWQ_PACK_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
+
+
+def pack(imatrix: torch.Tensor, direction: str = "column"):
+    """
+    Packs a 4-bit integer matrix into a packed 32-bit integer matrix.
+    Args:
+        imatrix (torch.Tensor): matrix of integers
+        direction (str): direction of packing, either "column" or "row"
+    Returns:
+        qmatrix (torch.Tensor): packed matrix of integers
+    """
+    shifts = torch.arange(0, 32, 4, dtype=torch.int32, device=imatrix.device)
+
+    imatrix = imatrix.to(torch.int8) & 0x0F  # eventually correct overflow
+
+    if direction == "column":
+        imatrix = imatrix.view(-1, imatrix.shape[1] // (32 // 4), (32 // 4))
+        qmatrix = torch.bitwise_left_shift(imatrix, shifts[None, None, :]).sum(dim=-1)
+
+    elif direction == "row":
+        imatrix = imatrix.view(imatrix.shape[0] // (32 // 4), (32 // 4), -1)
+        qmatrix = torch.bitwise_left_shift(imatrix, shifts[None, :, None]).sum(dim=1)
+
+    qmatrix = qmatrix.to(torch.int32)
+
+    return qmatrix
+
+
+def unpack(qmatrix: torch.Tensor, direction: str = "column"):
+    """
+    Unpacks a 32-bit packed integer matrix into a 4-bit integer matrix.
+    Args:
+        qmatrix (torch.Tensor): matrix of packed integers
+        direction (str): direction of unpacking, either "column" or "row"
+    Returns:
+        imatrix (torch.Tensor): matrix of integers
+    """
+    shifts = torch.arange(0, 32, 4, device=qmatrix.device)
+
+    if direction == "column":
+        imatrix = torch.bitwise_right_shift(
+            qmatrix[:, :, None], shifts[None, None, :]
+        ).view(qmatrix.shape[0], -1)
+
+    elif direction == "row":
+        imatrix = torch.bitwise_right_shift(
+            qmatrix[:, None, :], shifts[None, :, None]
+        ).view(-1, qmatrix.shape[-1])
+
+    imatrix = imatrix.to(torch.int8) & 0x0F  # eventually correct overflow
+
+    return imatrix
+
+
+def apply_order(
+    imatrix: torch.Tensor,
+    direction: str = "column",
+    order: List[int] = AWQ_PACK_ORDER,
+):
+    """
+    Applies the order to a 4-bit integer matrix.
+    Args:
+        imatrix (torch.Tensor): matrix of integers
+        direction (str): direction of applying order, either "column" or "row"
+        order (List[int]): order to apply, default is AWQ_PACK_ORDER
+    Returns:
+        imatrix (torch.Tensor): matrix of integers
+    """
+    if direction == "column":
+        imatrix = imatrix.view(-1, (32 // 4))[:, order].view(imatrix.shape)
+    elif direction == "row":
+        imatrix = imatrix.view((32 // 4), -1)[order, :].view(imatrix.shape)
+
+    return imatrix
+
+def convert_awq_to_gptq(matrix, is_qzeros=False):
+    # AWQ uses column packing
+    imatrix = unpack(matrix, direction="column")
+    # Reverse the order of the imatrix tensor
+    imatrix = apply_order(imatrix, direction="column", order=REVERSE_AWQ_PACK_ORDER)
+    if is_qzeros:
+        # Subtract 1 from the imatrix tensor (GPTQ adds 1 to the zeros)
+        imatrix = imatrix - 1
+    # exllama uses row packing for weights and column packing for zeros
+    direction = "column" if is_qzeros else "row"
+    qmatrix = pack(imatrix, direction=direction)
+    return qmatrix
+def fast_awq_to_gptq_qweight(qweight):
+    return convert_awq_to_gptq(qweight, is_qzeros=False)
+def fast_awq_to_gptq_qzeros(qzeros):
+    return convert_awq_to_gptq(qzeros, is_qzeros=True)
+
+
+def gptq_reorder_kernel(out_tensors: list, dtype, name, file, groupsize, quant_method):
     import re
     tensor = file.get_tensor(name)
+    if quant_method == 'awq':
+        if re.match('.*\.qweight$', name):
+            tensor = fast_awq_to_gptq_qweight(tensor)
+        elif re.match('.*\.qzeros$', name):
+            tensor = fast_awq_to_gptq_qzeros(tensor)
     if re.match('.*\.self_attn.*\.qweight$', name):
         tensor = reorder_mm_weight(tensor)
     elif re.match('.*\.self_attn.*\.scales$', name):
@@ -125,13 +226,13 @@ def gptq_reorder_kernel(out_tensors: list, dtype, name, file, groupsize):
         tensor = tensor.to(dtype)
     out_tensors[name] = tensor
 
-def llama_w4a16_reorder(src_weight_file, dst_weight_file, groupsize, dtype):
+def llama_w4a16_reorder(src_weight_file, dst_weight_file, groupsize, dtype, quant_method):
     from safetensors import safe_open
     from safetensors.torch import save_file
     new_tensors = {}
     with safe_open(src_weight_file, framework="pt", device="cpu") as f:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(gptq_reorder_kernel, new_tensors, dtype, key, f, groupsize) for key in f.keys()]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=24) as executor:
+            futures = [executor.submit(gptq_reorder_kernel, new_tensors, dtype, key, f, groupsize, quant_method) for key in f.keys()]
         for future in concurrent.futures.as_completed(futures):
             future.result()
     save_file(new_tensors, dst_weight_file)
@@ -152,7 +253,8 @@ def weight_reorder(model_id, quantize, dtype, groupsize):
                         os.path.join(model_id, filename),
                         os.path.join(reorder_path, filename),
                         groupsize,
-                        dtype
+                        dtype,
+                        quantize
                     )
         get_world_group().barrier()
         logger.warning(f"Weight reorder success.")

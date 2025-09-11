@@ -48,7 +48,7 @@ class SophTpuPlatform(Platform):
     device_control_env_var: str = "SOPHTPU_VISIBLE_CHIPS"
 
     supported_quantization: list[str] = [
-        "gptq","fp8",
+        "gptq","fp8", "awq",
     ]
 
     @classmethod
