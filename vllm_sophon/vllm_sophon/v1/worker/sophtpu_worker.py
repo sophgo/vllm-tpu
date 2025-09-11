@@ -126,12 +126,9 @@ class SophTPUWorker:
 
         bytes_per_elem = torch.tensor([], dtype=self.cache_dtype).element_size()
 
-        soph_config_manager = get_soph_config_manager()
-        print(soph_config_manager)
-        batch_size = soph_config_manager.get('CURRENT_BATCH_SIZE')
-        if batch_size is None:
-            batch_size = 128
-
+        # NOTE: It's not a good way to estimate the memory usage using the max-num-seqs.
+        # This will cause the memory usage to be overestimated.
+        batch_size = self.vllm_config.scheduler_config.max_num_seqs
         block_size = self.vllm_config.cache_config.block_size
         coef = 1 if self.model_config.use_mla else 2
         kvcache_memory = coef * num_hidden_layers * batch_size * \

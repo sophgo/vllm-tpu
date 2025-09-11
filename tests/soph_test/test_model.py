@@ -99,14 +99,14 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--useV1", 
-        type=bool, 
-        default=True, 
+        "--useV1",
+        type=bool,
+        default=True,
         help="Use vLLM V1. Set False to use V0.")
-    
+
     parser.add_argument(
-        "--tp_size", 
-        type=int, 
+        "--tp_size",
+        type=int,
         required=True,
         help="Tensor Parallel size. Set to 1 to disable tensor parallel.")
 
@@ -138,11 +138,12 @@ def default_llm_engine(model_id, is_multi_modal, dtype, use_v1, batch, max_new_t
         trust_remote_code=True,
         tensor_parallel_size=tp_size,
         distributed_executor_backend=None if tp_size == 1 else 'mp',
+        max_num_seqs=batch,
         max_num_batched_tokens = max(batch * input_length, 8192),
     )
     if use_v1:
         os.environ["VLLM_USE_V1"] = "1"
-        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0" 
+        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         from vllm.v1.engine.llm_engine import LLMEngine as V1LLMEngine
         engine_class = V1LLMEngine
     else:
@@ -293,6 +294,7 @@ def test_whole_model(
 ):
     prof = None
     profile_starting_token = soph_config_manager.get("PROFILE_STARTING_TOKEN")
+    # TODO: You can remove this while using vllm-sophon. Use `max-num-seqs` instead.
     soph_config_manager.config['CURRENT_BATCH_SIZE'] = batch
 
     config_dict, _ = PretrainedConfig.get_config_dict(model_id)
@@ -331,7 +333,7 @@ def test_whole_model(
             if repeat_i > 0 and ENABLE_PROFILE and step_counter >= profile_starting_token:
                 torch.ops.my_ops.enable_profile(int(1e6), BOOK_KEEPING)
             os.environ["TOKEN_IDX"] = str(step_counter)
-            
+
             generate_start = time.time_ns()
             generations = llm_engine.step()
             generate_end = time.time_ns()
@@ -356,7 +358,7 @@ def test_whole_model(
             if new_texts_log:
                 logger.info(f'Token {step_counter} {[text for text in new_texts_log]}')
             step_counter += 1
-            
+
         if llm_engine.has_unfinished_requests():
             reqs_to_abort= [g.request_id for g in generations]
             llm_engine.abort_request(reqs_to_abort)
@@ -404,7 +406,7 @@ def collect_meta(args):
     from torch_tpu.utils.collect_env import collect_cpu_performance,pretty_version_info
     from torch_tpu.tpu.versions import versions
     import traceback
-    
+
     try:
         torch_version_info = pretty_version_info()
     except Exception as e:
