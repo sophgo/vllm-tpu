@@ -156,7 +156,8 @@ def default_llm_engine(model, quantize, path, use_v1, tp_size, batches):
         enforce_eager=True,
         trust_remote_code=True,
         tensor_parallel_size=tp_size,
-        distributed_executor_backend=None if tp_size == 1 else 'mp'
+        distributed_executor_backend=None if tp_size == 1 else 'mp',
+        max_num_batched_tokens = max(batches * CONTEXT_LEN, 8192),
     )
     if use_v1:
         os.environ["VLLM_USE_V1"] = "1"

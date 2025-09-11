@@ -126,7 +126,7 @@ def apply_chat_template(question):
     ]
     return messages
 
-def default_llm_engine(model_id, is_multi_modal, dtype, use_v1, max_new_tokens, input_length, tp_size):
+def default_llm_engine(model_id, is_multi_modal, dtype, use_v1, batch, max_new_tokens, input_length, tp_size):
     if is_multi_modal:
         input_length = input_length + MAX_IMG_TOKEN
 
@@ -137,7 +137,8 @@ def default_llm_engine(model_id, is_multi_modal, dtype, use_v1, max_new_tokens, 
         enforce_eager=True,
         trust_remote_code=True,
         tensor_parallel_size=tp_size,
-        distributed_executor_backend=None if tp_size == 1 else 'mp'
+        distributed_executor_backend=None if tp_size == 1 else 'mp',
+        max_num_batched_tokens = max(batch * input_length, 8192),
     )
     if use_v1:
         os.environ["VLLM_USE_V1"] = "1"
@@ -299,7 +300,7 @@ def test_whole_model(
     is_multi_modal = model_type in {"llava_next", "qwen2_vl", "qwen2_5_vl"}
 
     llm_engine = default_llm_engine(
-        model_id=model_id, is_multi_modal=is_multi_modal, dtype=dtype, use_v1=use_v1, 
+        model_id=model_id, is_multi_modal=is_multi_modal, dtype=dtype, use_v1=use_v1, batch=batch,
         max_new_tokens=max_new_tokens, input_length=input_length, tp_size=tp_size
     )
 
