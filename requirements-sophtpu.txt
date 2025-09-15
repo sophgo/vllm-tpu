@@ -46,4 +46,4 @@ wheel
 jinja2
 
 # Dependencies for Sophon TPUs
-ray[default] >= 2.9
+# ray[default] >= 2.9
