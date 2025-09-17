@@ -16,6 +16,7 @@ from vllm.attention.layer import Attention
 from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
+from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.model_loader import get_model
 from vllm.sampling_params import SamplingType
 from vllm.utils import LayerBlockType, cdiv, is_pin_memory_available, get_dtype_size
@@ -134,8 +135,6 @@ class SophTPUModelRunner:
 
         # Multi-modal data support
         self.uses_mrope = model_config.uses_mrope
-        # TODO: Support M-RoPE (e.g, Qwen2-VL)
-        assert not self.uses_mrope, "TPU does not support M-RoPE yet."
 
         encoder_compute_budget, encoder_cache_size = compute_encoder_budget(
             model_config=model_config,
@@ -189,6 +188,31 @@ class SophTPUModelRunner:
                             device="cpu"))
             self.input_positions_np.append(
                 self.input_positions_cpu[-1].numpy())
+
+            # M-RoPE support (e.g, Qwen2-VL)
+            if self.uses_mrope:
+                # NOTE: `mrope_positions` is implemented with one additional dummy
+                # position on purpose to make it non-contiguous so that it can work
+                # with torch compile.
+                # See detailed explanation in https://github.com/vllm-project/vllm/pull/12128#discussion_r1926431923
+
+                # NOTE: When M-RoPE is enabled, position ids are 3D regardless of
+                # the modality of inputs. For text-only inputs, each dimension has
+                # identical position IDs, making M-RoPE functionally equivalent to
+                # 1D-RoPE.
+                # See page 5 of https://arxiv.org/abs/2409.12191
+                self.mrope_positions_cpu = []
+                self.mrope_positions_np = []
+                self.mrope_positions = torch.zeros((3, self.max_num_tokens + 1),
+                                                dtype=torch.int32,
+                                                device=self.device)
+                self.mrope_positions_cpu = torch.zeros(
+                    (3, self.max_num_tokens + 1),
+                    dtype=torch.int64,
+                    device="cpu",
+                    pin_memory=self.pin_memory)
+                self.mrope_positions_np.append(
+                self.mrope_positions_cpu[-1].numpy())
 
             self.slot_mapping_cpu.append(
                 torch.empty(self.max_num_tokens,
@@ -324,6 +348,34 @@ class SophTPUModelRunner:
                 lora_request=new_req_data.lora_request,
             )
 
+            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+            if self.uses_mrope:
+                image_grid_thw = []
+                video_grid_thw = []
+                second_per_grid_ts = []
+                for mm_input in self.requests[req_id].mm_inputs:
+                    if mm_input.get("image_grid_thw") is not None:
+                        image_grid_thw.extend(
+                            mm_input["image_grid_thw"].tolist())
+                    if mm_input.get("video_grid_thw") is not None:
+                        video_grid_thw.extend(
+                            mm_input["video_grid_thw"].tolist())
+                    if mm_input.get("second_per_grid_ts") is not None:
+                        second_per_grid_ts.extend(
+                            mm_input["second_per_grid_ts"])
+
+                hf_config = self.model_config.hf_config
+
+                self.requests[req_id].mrope_positions, \
+                    self.requests[req_id].mrope_position_delta = \
+                    MRotaryEmbedding.get_input_positions_tensor(
+                        self.requests[req_id].prompt_token_ids,
+                        hf_config=hf_config,
+                        image_grid_thw=image_grid_thw,
+                        video_grid_thw=video_grid_thw,
+                        second_per_grid_ts=second_per_grid_ts,
+                    )
+
             req_ids_to_add.append(req_id)
 
         # Update the states of the running/resumed requests.
@@ -445,7 +497,6 @@ class SophTPUModelRunner:
         encoder_outputs = []
         for grouped_mm_inputs in grouped_mm_inputs_list:
             batched_mm_inputs = MultiModalKwargs.batch(grouped_mm_inputs)
-            batched_mm_inputs['image_sizes'] = batched_mm_inputs['image_sizes'].to(dtype=torch.int32)
             batched_mm_inputs = MultiModalKwargs.as_kwargs(
                 batched_mm_inputs,
                 device=self.device,
@@ -598,6 +649,13 @@ class SophTPUModelRunner:
         block_tables = []
         max_blocks = 0
 
+        # 为M-RoPE准备CPU缓冲区
+        if self.uses_mrope:
+            total_tokens = sum(pd_info.prompt_scheduled_tokens)
+            mrope_positions_cpu = torch.empty((3, total_tokens), dtype=torch.int32)
+
+        mrope_pos_ptr = 0
+
         for i, req_id in enumerate(req_ids):
             req_state = self.requests[req_id]
             prompt_token_ids = req_state.prompt_token_ids
@@ -605,7 +663,6 @@ class SophTPUModelRunner:
             num_computed = req_state.num_computed_tokens
             start_idx = max(0, len(prompt_token_ids) - self.sliding_window) if self.sliding_window else 0
             process_tokens = prompt_token_ids[num_computed:num_computed+pd_info.prompt_scheduled_tokens[i]]
-            # input_tokens\input_positions\prompt_lens\context_lens
             input_tokens.extend(process_tokens)
             input_positions.extend(range(num_computed, num_computed + len(process_tokens)))
             prompt_lens.append(len(process_tokens))
@@ -622,6 +679,39 @@ class SophTPUModelRunner:
                 slot = block_ids[block_idx] * self.block_size + block_offset
                 slot_mapping.append(slot)
 
+            # M-RoPE位置计算（prompt阶段）
+            if self.uses_mrope:
+                req = self.requests[req_id]
+                assert req.mrope_positions is not None
+                assert req.mrope_positions.shape[0] == 3, "M-RoPE positions should have 3 dimensions"
+
+                num_scheduled_tokens = len(process_tokens)
+                num_prompt_tokens = len(req.prompt_token_ids)
+
+                if num_computed + num_scheduled_tokens <= num_prompt_tokens:
+                    mrope_positions_cpu[:, mrope_pos_ptr:mrope_pos_ptr+num_scheduled_tokens] = \
+                        req.mrope_positions[:, num_computed:num_computed+num_scheduled_tokens]
+                else:
+                    prompt_part_len = max(0, num_prompt_tokens - num_computed)
+                    completion_part_len = max(0, num_scheduled_tokens - prompt_part_len)
+                    
+                    if prompt_part_len > 0:
+                        mrope_positions_cpu[:, mrope_pos_ptr:mrope_pos_ptr+prompt_part_len] = \
+                            req.mrope_positions[:, num_computed:num_computed+prompt_part_len]
+                        mrope_pos_ptr += prompt_part_len
+
+                    if completion_part_len > 0:
+                        completion_positions = MRotaryEmbedding.get_next_input_positions_tensor(
+                            req.mrope_position_delta,
+                            context_len=num_computed + prompt_part_len,
+                            seq_len=num_computed + prompt_part_len + completion_part_len,
+                        )
+                        assert completion_positions.shape[0] == 3, "M-RoPE positions should have 3 dimensions"
+                        mrope_positions_cpu[:, mrope_pos_ptr:mrope_pos_ptr+completion_part_len] = \
+                            completion_positions
+                        mrope_pos_ptr += completion_part_len
+                mrope_pos_ptr += num_scheduled_tokens
+
             # block_tables
             req_blocks = [bid for bid in block_ids
                         if bid >= (start_idx // self.block_size)]
@@ -630,7 +720,14 @@ class SophTPUModelRunner:
 
         # to tensor
         input_tokens = torch.tensor(input_tokens, dtype=torch.int32, device=self.device)
-        input_positions = torch.tensor(input_positions, dtype=torch.int32, device=self.device)
+        # 处理位置信息
+        if self.uses_mrope:
+            mrope_positions = torch.empty_like(mrope_positions_cpu, device=self.device)
+            mrope_positions.copy_(mrope_positions_cpu, non_blocking=True)
+            input_positions = mrope_positions
+        else:
+            input_positions = torch.tensor(input_positions, dtype=torch.int32, device=self.device)
+
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device=self.device)
         cache_lengths = torch.tensor(cache_lengths, dtype=torch.int32, device="cpu")
         prompt_lens_tensor = torch.tensor(prompt_lens, dtype=torch.int32, device="cpu")
@@ -664,7 +761,10 @@ class SophTPUModelRunner:
 
         block_tables = []
         max_blocks = 0
-        for req_id in req_ids:
+        if self.uses_mrope:
+            mrope_positions_cpu = torch.empty((3, len(req_ids)), dtype=torch.int32)
+
+        for i, req_id in enumerate(req_ids):
             req_state = self.requests[req_id]
             output_token_ids = req_state.output_token_ids
             generation_token = output_token_ids[-1]
@@ -692,6 +792,25 @@ class SophTPUModelRunner:
             slot = block_ids[block_idx] * self.block_size + block_offset
             slot_mapping.append(slot)
 
+            # M-RoPE位置计算（decode阶段）
+            if self.uses_mrope:
+                req = self.requests[req_id]
+                assert req.mrope_positions is not None
+                assert req.mrope_positions.shape[0] == 3, "M-RoPE positions should have 3 dimensions"
+
+                num_prompt_tokens = len(req.prompt_token_ids)
+
+                if num_computed < num_prompt_tokens:
+                    mrope_positions_cpu[:, i] = req.mrope_positions[:, num_computed]
+                else:
+                    next_position = MRotaryEmbedding.get_next_input_positions_tensor(
+                        req.mrope_position_delta,
+                        context_len=num_computed,
+                        seq_len=num_computed + 1,
+                    )
+                    assert next_position.shape[0] == 3, "M-RoPE positions should have 3 dimensions"
+                    mrope_positions_cpu[:, i] = next_position[:, 0]  # 只取第一个位置
+
             # block_tables
             req_blocks = [bid for bid in block_ids
                         if bid >= (start_idx // self.block_size)]
@@ -700,7 +819,13 @@ class SophTPUModelRunner:
 
         # to tensor
         input_tokens = torch.tensor(input_tokens, dtype=torch.int32, device=self.device)
-        input_positions = torch.tensor(input_positions, dtype=torch.int32, device=self.device)
+        # 处理位置信息
+        if self.uses_mrope:
+            mrope_positions = torch.empty_like(mrope_positions_cpu, device=self.device)
+            mrope_positions.copy_(mrope_positions_cpu, non_blocking=True)
+            input_positions = mrope_positions
+        else:
+            input_positions = torch.tensor(input_positions, dtype=torch.int32, device=self.device)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device=self.device)
         cache_lengths = torch.tensor(cache_lengths, dtype=torch.int32, device="cpu")
         input_lengths = torch.tensor(input_lengths, dtype=torch.int32, device="cpu")
@@ -876,9 +1001,17 @@ class SophTPUModelRunner:
             token_ids = torch.zeros((num_tokens, seq_len),
                                     dtype=torch.int32,
                                     device=self.device)
-            position_ids = torch.zeros((num_tokens, seq_len),
-                                       dtype=torch.int32,
-                                       device=self.device)
+            if self.uses_mrope:
+                # M-RoPE 需要 3 维位置编码（如 height, width, text_pos）
+                mrope_positions = torch.zeros((3, num_tokens, seq_len),
+                                            dtype=torch.int32,
+                                            device=self.device)
+                position_ids = mrope_positions  # 使用 M-RoPE 位置编码
+            else:
+                # 普通 1D 位置编码
+                position_ids = torch.zeros((num_tokens, seq_len),
+                                        dtype=torch.int32,
+                                        device=self.device)
             slot_mapping = torch.zeros((num_tokens, seq_len),
                                        dtype=torch.int64,
                                        device=self.device)
@@ -923,9 +1056,16 @@ class SophTPUModelRunner:
             token_ids = torch.zeros((num_tokens, seq_len),
                                     dtype=torch.int32,
                                     device=self.device)
-            position_ids = torch.zeros((num_tokens, seq_len),
-                                       dtype=torch.int32,
-                                       device=self.device)
+            if self.uses_mrope:
+                # M-RoPE 需要 3 维位置编码（如 height, width, text_pos）
+                position_ids = torch.zeros((3, num_tokens, seq_len),
+                                         dtype=torch.int32,
+                                         device=self.device)
+            else:
+                # 普通 1D 位置编码
+                position_ids = torch.zeros((num_tokens, seq_len),
+                                         dtype=torch.int32,
+                                         device=self.device)
             slot_mapping = torch.zeros((num_tokens, seq_len),
                                        dtype=torch.int64,
                                        device=self.device)

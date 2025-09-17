@@ -100,6 +100,8 @@ _TEXT_GENERATION_MODELS = {
     "Qwen2ForCausalLM": ("soph_qwen2", "Qwen2ForCausalLM"),
     "Qwen3ForCausalLM": ("soph_qwen3", "Qwen3ForCausalLM"),
     "Qwen2MoeForCausalLM": ("qwen2_moe", "Qwen2MoeForCausalLM"),
+    "Qwen2VLForConditionalGeneration": ("soph_qwen2_vl", "Qwen2VLForConditionalGeneration"),
+    "Qwen2_5_VLForConditionalGeneration": ("soph_qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),
     "RWForCausalLM": ("falcon", "FalconForCausalLM"),
     "StableLMEpochForCausalLM": ("stablelm", "StablelmForCausalLM"),
     "StableLmForCausalLM": ("stablelm", "StablelmForCausalLM"),
@@ -143,7 +145,9 @@ _EMBEDDING_MODELS = {
     # [Multimodal]
     "LlavaNextForConditionalGeneration": ("soph_llava_next", "LlavaNextForConditionalGeneration"),  # noqa: E501
     "Phi3VForCausalLM": ("phi3v", "Phi3VForCausalLM"),
-    "Qwen2VLForConditionalGeneration": ("qwen2_vl", "Qwen2VLForConditionalGeneration"),  # noqa: E501
+    # "Qwen2VLForConditionalGeneration": ("qwen2_vl", "Qwen2VLForConditionalGeneration"),  # noqa: E501
+    "Qwen2VLForConditionalGeneration": ("soph_qwen2_vl", "Qwen2VLForConditionalGeneration"),  # noqa: E501
+    "Qwen2_5_VLForConditionalGeneration": ("soph_qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),  # noqa: E501
     # [Auto-converted (see adapters.py)]
     #"Qwen2ForSequenceClassification": ("qwen2", "Qwen2ForCausalLM"),
     "Qwen2ForSequenceClassification": ("soph_qwen2", "Qwen2ForCausalLM"),
@@ -185,8 +189,10 @@ _MULTIMODAL_MODELS = {
     "Phi3VForCausalLM": ("phi3v", "Phi3VForCausalLM"),
     "PixtralForConditionalGeneration": ("pixtral", "PixtralForConditionalGeneration"),  # noqa: E501
     "QwenVLForConditionalGeneration": ("qwen_vl", "QwenVLForConditionalGeneration"),  # noqa: E501
-    "Qwen2VLForConditionalGeneration": ("qwen2_vl", "Qwen2VLForConditionalGeneration"),  # noqa: E501
-    "Qwen2_5_VLForConditionalGeneration": ("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),  # noqa: E501
+    # "Qwen2VLForConditionalGeneration": ("qwen2_vl", "Qwen2VLForConditionalGeneration"),  # noqa: E501
+    "Qwen2VLForConditionalGeneration": ("soph_qwen2_vl", "Qwen2VLForConditionalGeneration"),  # noqa: E501
+    # "Qwen2_5_VLForConditionalGeneration": ("qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),  # noqa: E501
+    "Qwen2_5_VLForConditionalGeneration": ("soph_qwen2_5_vl", "Qwen2_5_VLForConditionalGeneration"),  # noqa: E501
     "Qwen2AudioForConditionalGeneration": ("qwen2_audio", "Qwen2AudioForConditionalGeneration"),  # noqa: E501
     "UltravoxModel": ("ultravox", "UltravoxModel"),
     # [Encoder-decoder]

@@ -866,8 +866,8 @@ class MRotaryEmbedding(RotaryEmbedding):
     def forward(
         self,
         positions: torch.Tensor,
-        query: torch.Tensor,
-        key: torch.Tensor,
+        query: Optional[torch.Tensor] = None,  # 改为可选参数
+        key: Optional[torch.Tensor] = None,    # 改为可选参数
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward().
 
@@ -878,7 +878,10 @@ class MRotaryEmbedding(RotaryEmbedding):
             query: [num_tokens, num_heads * head_size]
             key: [num_tokens, num_kv_heads * head_size]
         """
+        if current_platform.is_sophtpu():
+            return self.forward_sophtpu(positions, query, key)
         assert positions.ndim == 1 or positions.ndim == 2
+        assert query is not None and key is not None
 
         num_tokens = positions.shape[-1]
         cos_sin = self.cos_sin_cache[positions]
@@ -911,6 +914,42 @@ class MRotaryEmbedding(RotaryEmbedding):
         key_rot = _apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
+    
+    def forward_sophtpu(
+        self,
+        positions: torch.Tensor,
+        query: Optional[torch.Tensor] = None,  # 改为可选参数
+        key: Optional[torch.Tensor] = None,    # 改为可选参数
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """PyTorch-native implementation equivalent to forward().
+
+        Args:
+            positions:
+                [num_tokens,] (text only) or
+                [3, num_tokens] (T/H/W positions with multimodal inputs)
+            query: [num_tokens, num_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        assert positions.ndim == 1 or positions.ndim == 2
+
+        num_tokens = positions.shape[-1]
+        cos_sin = self.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        if positions.ndim == 2:
+            assert self.mrope_section
+
+            cos = torch.cat([
+                m[i]
+                for i, m in enumerate(cos.split(self.mrope_section, dim=-1))
+            ],
+                            dim=-1)
+            sin = torch.cat([
+                m[i]
+                for i, m in enumerate(sin.split(self.mrope_section, dim=-1))
+            ],
+                            dim=-1)
+
+        return cos, sin
 
     @staticmethod
     def get_input_positions(

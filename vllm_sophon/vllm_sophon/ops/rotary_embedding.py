@@ -2,7 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 from vllm.model_executor.layers.rotary_embedding import (
-    DeepseekScalingRotaryEmbedding, RotaryEmbedding)
+    DeepseekScalingRotaryEmbedding, RotaryEmbedding, MRotaryEmbedding)
 from vllm.model_executor.layers.rotary_embedding import (
     _yarn_find_correction_range, _yarn_linear_ramp_mask)
 
@@ -64,8 +64,36 @@ def rope_deepseek_forward_oot(
 
     return cos, sin
 
+def rope_qwen2_5_vl_forward_oot(
+    self,
+    positions: torch.Tensor,
+    query: Optional[torch.Tensor] = None,  # 改为可选参数
+    key: Optional[torch.Tensor] = None,    # 改为可选参数
+) -> Tuple[torch.Tensor, torch.Tensor]:
+
+    assert positions.ndim == 1 or positions.ndim == 2
+
+    num_tokens = positions.shape[-1]
+    cos_sin = self.cos_sin_cache[positions]
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    if positions.ndim == 2:
+        assert self.mrope_section
+
+        cos = torch.cat([
+            m[i]
+            for i, m in enumerate(cos.split(self.mrope_section, dim=-1))
+        ],
+                        dim=-1)
+        sin = torch.cat([
+            m[i]
+            for i, m in enumerate(sin.split(self.mrope_section, dim=-1))
+        ],
+                        dim=-1)
+
+    return cos, sin
 
 RotaryEmbedding.forward_oot = rope_forward_oot
 DeepseekScalingRotaryEmbedding._compute_inv_freq = rope_deepseek_compute_inv_freq
 DeepseekScalingRotaryEmbedding._compute_cos_sin_cache = rope_deepseek_compute_cos_sin_cache
 DeepseekScalingRotaryEmbedding.forward = rope_deepseek_forward_oot
+MRotaryEmbedding.forward = rope_qwen2_5_vl_forward_oot

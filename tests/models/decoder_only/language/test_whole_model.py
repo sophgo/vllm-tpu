@@ -35,7 +35,7 @@ parser.add_argument(
     default="qwen2-7b",
     # required=True,
     choices=["llama2-7b", "llama3.1-8b", "llama3.1-70b", "qwen2.5-32b", "qwen2.5-14b", "qwen2.5-7b","qwen2-7b", "qwen2-72b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwen3-8b", "qwen3-235b-a22b",
-             "qwq", "deepseek_v2", "deepseek_v3", "llava_next"],
+             "qwq", "deepseek_v2", "deepseek_v3", "llava_next", "qwen2_vl", "qwen2_5_vl"],
     help="Model name to test (e.g., llama2-7b, llama3.1-8b, llama3.1-70b, qwen2.5-32b, qwen2.5-14b, qwen2-7b, qwen2-57b-a14b, qwen3-32b, qwq, qwen3-8b, deepseek_v2, deepseek_v3)",
 )
 parser.add_argument(
@@ -101,6 +101,14 @@ def default_llm_engine(model, quantize, path, use_v1, tp_size, batches):
         "qwen2-72b": {
             "gptq": {"model_id": "Qwen2-72B-Instruct-GPTQ-Int4","dtype": "float16"},
             "default": {"model_id": "Qwen2-72B-Instruct", "dtype": "bfloat16"}
+        },
+        "qwen2_vl": {
+            "gptq": {"model_id": "Qwen2-VL-7B-Instruct","dtype": "float16"},
+            "default": {"model_id": "Qwen2-VL-7B-Instruct", "dtype": "bfloat16"}
+        },
+        "qwen2_5_vl": {
+            "gptq": {"model_id": "Qwen2.5-VL-7B-Instruct","dtype": "float16"},
+            "default": {"model_id": "Qwen2.5-VL-7B-Instruct", "dtype": "bfloat16"}
         },
         "qwen2-57b-a14b": {
             "gptq": {"model_id": "Qwen2-57B-A14B-Instruct-GPTQ-Int4","dtype": "float16"},
@@ -221,7 +229,7 @@ def deepseek_chat_wrapper(question):
 
 # group model by model structure
 llama_models = ["llama2-7b", "llama3.1-8b", "llama3.1-70b"]
-qwen_models = ["qwen2.5-32b", "qwen2.5-14b", "qwen2-7b","qwen2-72b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwq", "qwen3-8b", "qwen3-235b-a22b"]
+qwen_models = ["qwen2.5-32b", "qwen2.5-14b", "qwen2-7b","qwen2-72b", "qwen2-57b-a14b", "qwen3-32b", "qwen3-4b", "qwq", "qwen3-8b", "qwen3-235b-a22b", "qwen2_vl", "qwen2_5_vl"]
 deepseek_models = ["deepseek_v2", "deepseek_v3"]
 multimodal_models = ["llava_next", "qwen2_vl", "qwen2_5_vl"]
 # decide the chat wrapper by model type
@@ -288,10 +296,13 @@ def gen_vlm_test_batch_prompt(model_id, batch_size):
             except Exception as e:
                 logger.error(f"Failed to download image: {e}")
 
-    def gen_batch_pb(batch_size, img_pth):
+    def gen_batch_pb(batch_size, img_pth, model_id):
         prompt_header = "A chat between a curious human and an artificial intelligence assistant. \
                         The assistant gives helpful, detailed, and polite answers to the human's questions. USER: ![]("
-        question = "<image>What is shown in this image?ASSISTANT:"
+        if model_id == "/data/Qwen2.5-VL-7B-Instruct" or model_id == "qwen2_5_vl":
+            question = "<|im_start|>user\n<|image_pad|>\nWhat is shown in this image?<|im_end|>\n<|im_start|>assistant\n"
+        else:
+            question = "<image>What is shown in this image?ASSISTANT:"
         input_str = f"{prompt_header}{question}"
 
         from PIL import Image
@@ -314,7 +325,7 @@ def gen_vlm_test_batch_prompt(model_id, batch_size):
 
     img_pth = "dataset/images/chicken_on_money.png"
     prepare_image(img_pth)
-    batch_pb, num_prompts_total_tokens = gen_batch_pb(batch_size, img_pth)
+    batch_pb, num_prompts_total_tokens = gen_batch_pb(batch_size, img_pth, model_id)
 
     return batch_pb, num_prompts_total_tokens
 

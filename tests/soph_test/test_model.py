@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import os, time
+import os, time, json
 import numpy as np
 import math
 from datetime import datetime
@@ -195,7 +195,6 @@ def validate_and_add_requests(
         for prompt in prompts:
             tokens = tokenizer.encode(prompt, max_length=input_length, truncation=True)
             input_tokens_len.append(len(tokens))
-
             truncated_text = tokenizer.decode(tokens, skip_special_tokens=True)
             truncated_prompts.append(truncated_text)
     else:
@@ -243,7 +242,7 @@ def gen_test_case(batch_size, chat: False):
 
     return questions
 
-def gen_vlm_test_batch(batch_size):
+def gen_vlm_test_batch(batch_size, model_id):
     def prepare_image(img_pth):
         if not os.path.exists(img_pth):
             try:
@@ -257,10 +256,19 @@ def gen_vlm_test_batch(batch_size):
             except Exception as e:
                 logger.error(f"Failed to download image: {e}")
 
-    def gen_batch_pb(batch_size, img_pth):
+    def gen_batch_pb(batch_size, img_pth, model_id):
         prompt_header = "A chat between a curious human and an artificial intelligence assistant. \
                         The assistant gives helpful, detailed, and polite answers to the human's questions. USER: ![]("
-        question = "<image>What is shown in this image?ASSISTANT:"
+
+        config_json_path = os.path.join(model_id, "config.json")
+        assert os.path.exists(config_json_path)
+        with open(config_json_path) as f:
+            config_json = json.load(f)
+        model_arch = config_json["architectures"]
+        if model_arch == ['Qwen2_5_VLForConditionalGeneration'] or model_arch == ['Qwen2VLForConditionalGeneration']:
+            question = "<|im_start|>user\n<|image_pad|>\nWhat is shown in this image?<|im_end|>\n<|im_start|>assistant\n"
+        else:
+            question = "<image>What is shown in this image?ASSISTANT:"
         input_str = f"{prompt_header}{question}"
 
         from PIL import Image
@@ -277,13 +285,13 @@ def gen_vlm_test_batch(batch_size):
 
     img_pth = "dataset/images/chicken_on_money.png"
     prepare_image(img_pth)
-    batch_pb = gen_batch_pb(batch_size, img_pth)
+    batch_pb = gen_batch_pb(batch_size, img_pth, model_id)
 
     return batch_pb
 
-def init_batch_prompt(is_multi_modal, batches, chat_mode):
+def init_batch_prompt(is_multi_modal, batches, chat_mode, model_id):
     if is_multi_modal:
-        next_batch = gen_vlm_test_batch(batches)
+        next_batch = gen_vlm_test_batch(batches, model_id)
     else:
         next_batch = gen_test_case(batches, chat_mode)
     return next_batch
@@ -306,7 +314,7 @@ def test_whole_model(
         max_new_tokens=max_new_tokens, input_length=input_length, tp_size=tp_size
     )
 
-    prompts = init_batch_prompt(is_multi_modal, batch, chat_mode)
+    prompts = init_batch_prompt(is_multi_modal, batch, chat_mode, model_id)
 
     for repeat_i in range(2):
         logger.warning(f'================================ Run iter: {repeat_i + 1} ================================')
