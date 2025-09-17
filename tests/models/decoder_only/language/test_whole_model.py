@@ -13,8 +13,6 @@ from transformers import AutoTokenizer
 import json
 from datetime import datetime
 
-from vllm.platforms.sophtpu import get_soph_config_manager
-# from vllm_sophon.platform import get_soph_config_manager
 from vllm.logger import init_logger
 from vllm.engine.llm_engine import LLMEngine
 from vllm.usage.usage_lib import UsageContext
@@ -24,6 +22,9 @@ from vllm.sampling_params import ( SamplingParams)
 from vllm.inputs import PromptType
 from vllm.pooling_params import PoolingParams
 from vllm.utils import Counter
+
+from vllm.platforms.sophtpu import get_soph_config_manager
+# from vllm_sophon.platform import get_soph_config_manager
 
 logger = init_logger(__name__)
 

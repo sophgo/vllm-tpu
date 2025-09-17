@@ -27,12 +27,11 @@ from vllm.model_executor.models.utils import (AutoWeightsLoader, flatten_bn,
                     init_vllm_registered_model, maybe_prefix)
 
 from vllm.model_executor.layers.quantization import QuantizationConfig
-from vllm_sophon.ops.soph_linear import (SophColumnParallelLinear,
-                                         SophRowParallelLinear)
 from vllm.distributed import (get_tensor_model_parallel_world_size,
                               get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_reduce)
-
+from vllm_sophon.ops.soph_linear import (SophColumnParallelLinear,
+                                         SophRowParallelLinear)
 
 class LlavaNextImagePixelInputs(TypedDict):
     type: Literal["pixel_values"]

@@ -31,7 +31,6 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 import numpy as np
 
-from vllm_sophon.platform import get_soph_config_manager
 from vllm.attention import Attention, AttentionMetadata, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
@@ -40,12 +39,7 @@ from vllm.distributed import (get_pp_group,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm_sophon.ops.soph_fused_moe import SophDeepseekV3FusedMoE
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm_sophon.ops.soph_linear import (SophColumnParallelLinear,
-                                                    SophReplicatedLinear,
-                                                    SophRowParallelLinear,
-                                                    soph_to_dtype)
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                MergedColumnParallelLinear,
                                                ReplicatedLinear,
@@ -55,7 +49,6 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm_sophon.ops.soph_embedding import SophEmbedding
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.utils import set_weight_attrs
@@ -66,6 +59,13 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
+from vllm_sophon.platform import get_soph_config_manager
+from vllm_sophon.ops.soph_fused_moe import SophDeepseekV3FusedMoE
+from vllm_sophon.ops.soph_linear import (SophColumnParallelLinear,
+                                                    SophReplicatedLinear,
+                                                    SophRowParallelLinear,
+                                                    soph_to_dtype)
+from vllm_sophon.ops.soph_embedding import SophEmbedding
 
 # def print_tensor_info(name, param):
 #     print(f"  - {name}:", end=" ")

@@ -35,9 +35,6 @@ from vllm.config import CacheConfig, VllmConfig, ParallelConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm_sophon.ops.soph_linear import (SophQKVParallelLinear,
-                                         SophColumnParallelLinear,
-                                         SophRowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.pooler import Pooler, PoolingType
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -64,6 +61,9 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.models.qwen2 import Qwen2Attention
 
+from vllm_sophon.ops.soph_linear import (SophQKVParallelLinear,
+                                         SophColumnParallelLinear,
+                                         SophRowParallelLinear)
 from vllm_sophon.ops.soph_embedding import SophEmbedding
 from vllm_sophon.ops.layernorm import SophonRMSNorm
 

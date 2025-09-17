@@ -25,13 +25,12 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-
-from vllm_sophon.attention.attention import (SophTPUAttentionBackend,
-                                             SophTPUMetadata)
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (MultiModalKwargs, PlaceholderRange)
 from vllm.multimodal.utils import group_mm_inputs_by_modality
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
+from vllm_sophon.attention.attention import (SophTPUAttentionBackend,
+                                             SophTPUMetadata)
 from vllm_sophon.hack.soph_utils import sanity_check_mm_encoder_outputs
 
 if TYPE_CHECKING:

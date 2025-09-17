@@ -13,13 +13,13 @@ from vllm.distributed import (divide,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
-from vllm_sophon.ops.soph_linear import (SophQKVParallelLinear,
-                                         SophRowParallelLinear)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsQuant
 
 from vllm.model_executor.models.vision import VisionEncoderInfo, resolve_visual_encoder_outputs
+from vllm_sophon.ops.soph_linear import (SophQKVParallelLinear,
+                                         SophRowParallelLinear)
 
 
 class CLIPEncoderInfo(VisionEncoderInfo[CLIPVisionConfig]):
