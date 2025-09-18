@@ -115,11 +115,10 @@ class SophTPUAttentionBackendImpl(AttentionImpl):
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         self.logits_soft_cap = logits_soft_cap
+        self.sliding_window = sliding_window
         if alibi_slopes is not None:
             raise NotImplementedError("Alibi slopes is not supported.")
-        if sliding_window is not None:
-            logger.warning("The context lengths must be less than sliding window.\
-                           This is temporarily method to support QwQ-32B.")
+        # if sliding_window is not None:
             # raise NotImplementedError("Sliding window is not supported.")
         if kv_cache_dtype != "auto":
             raise NotImplementedError("FP8 KV cache dtype is not supported.")
@@ -156,11 +155,16 @@ class SophTPUAttentionBackendImpl(AttentionImpl):
         Returns:
             shape = [batch_size, seq_len, num_heads * head_size]
         """
-        context_lengths = attn_metadata.input_lengths + attn_metadata.cache_lengths
         attn_output = attn_metadata.buffer['attn_out'] if output is None else output
-        torch.ops.my_ops.hybrid_attention(
+        # If sliding window is greater than the context length, we need to
+        # add a new kernel to support sliding window attention.
+        if self.sliding_window is not None:
+            context_lengths = attn_metadata.input_lengths + attn_metadata.cache_lengths
+            assert context_lengths.max().item() <= self.sliding_window, \
+                "The context lengths must be less than sliding window for hybrid attention."
+
+        torch.ops.my_ops.paged_attention_v2(
             attn_output,
-            torch.where(attn_metadata.input_lengths > 1)[0],
             query,
             key,
             value,
@@ -170,13 +174,9 @@ class SophTPUAttentionBackendImpl(AttentionImpl):
             attn_metadata.sin,
             attn_metadata.input_lengths,
             attn_metadata.cache_lengths,
-            context_lengths,
             attn_metadata.slot_mapping,
             attn_metadata.block_tables,
             None,
-            attn_metadata.block_tables.size(1),
-            context_lengths.max().item(),
-            kv_cache[0].size(1),
             self.scale
         )
         return attn_output

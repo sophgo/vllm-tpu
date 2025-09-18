@@ -231,7 +231,7 @@ def llama_w4a16_reorder(src_weight_file, dst_weight_file, groupsize, dtype, quan
     from safetensors.torch import save_file
     new_tensors = {}
     with safe_open(src_weight_file, framework="pt", device="cpu") as f:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=24) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             futures = [executor.submit(gptq_reorder_kernel, new_tensors, dtype, key, f, groupsize, quant_method) for key in f.keys()]
         for future in concurrent.futures.as_completed(futures):
             future.result()
