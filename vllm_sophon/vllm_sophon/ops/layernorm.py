@@ -25,7 +25,7 @@ class SophonRMSNorm(RMSNorm):
         residual: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is not None:
-            x = x + residual
+            x += residual
 
         residual = x
         torch.ops.my_ops.rmsnorm_forward(
