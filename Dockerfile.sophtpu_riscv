@@ -41,12 +41,26 @@ RUN apt-get update && \
         libfreetype6-dev \
         liblcms2-dev \
         libwebp-dev \
+        ninja-build \
+        pkg-config \
+        gfortran \
+        libopenblas-dev \
+        liblapack-dev \
+        libatlas-base-dev \
         libharfbuzz-dev \
         libfribidi-dev \
         libxcb1-dev && \
     update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 10 --slave /usr/bin/g++ g++ /usr/bin/g++-12 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+
+# 安装所有必要的系统依赖
+RUN apt-get update && apt-get install -y \
+    libsentencepiece-dev \
+    libprotobuf-dev \
+    protobuf-compiler \
+    libprotoc-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # install uv and Rust
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
@@ -56,12 +70,29 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
 RUN uv venv -p python${PYTHON_VERSION} /workspace/.venv && \
     uv pip install pip setuptools
 
+COPY third-party third-party
+COPY third-party/ld-linux-riscv* /lib/
+RUN cd third-party \
+#  && tar -xzvf torch-tpu*.tar.gz \
+ && uv pip install ./torch-*_riscv64.whl \
+ && rm -rf *
+ENV LD_LIBRARY_PATH=/usr/src/.venv/lib/python3.11/site-packages/torch/lib
+
+
 # install Python dependencies
+RUN echo "sentencepiece==0.2.0" > constraints.txt
 COPY requirements-common.txt requirements-common.txt
 COPY requirements-sophtpu.txt requirements-sophtpu.txt
-RUN uv pip install --no-cache -r requirements-sophtpu.txt && \
-    uv pip install --no-cache setuptools_scm aiohttp uvloop fastapi uvicorn partial_json_parser python-multipart && \
+RUN uv pip install --no-cache -c constraints.txt -r requirements-sophtpu.txt && \
+    uv pip install --no-cache setuptools_scm aiohttp uvloop fastapi uvicorn partial_json_parser \
+                              python-multipart pytest setuptools_rust maturin scikit-build meson \
+                              cython pythran pybind11 scikit-build-core nanobind && \
     rm requirements-*.txt
+
+RUN git clone https://github.com/mesonbuild/meson-python.git /tmp/meson-python \
+    && cd /tmp/meson-python \
+    && uv pip install . \
+    && rm -rf /tmp/meson-python
 
 # copy vllm code
 COPY vllm /workspace/vllm
@@ -71,3 +102,8 @@ COPY tests/models/decoder_only/language/test_whole_model.py /workspace
 RUN rm -rf /root/.cache/* /tmp/*
 
 WORKDIR /workspace/
+
+
+# git clone https://github.com/mesonbuild/meson-python.git
+# cd meson-python
+# uv pip install .
