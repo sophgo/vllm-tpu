@@ -21,11 +21,11 @@ from vllm.inputs import PromptType
 from vllm.pooling_params import PoolingParams
 from vllm.utils import Counter
 
-from vllm.sophtpu_utils import LLMQualityChecker
-from vllm.platforms.sophtpu import get_soph_config_manager
+# from vllm.sophtpu_utils import LLMQualityChecker
+# from vllm.platforms.sophtpu import get_soph_config_manager
 
-# from vllm_sophon.hack.soph_utils import LLMQualityChecker
-# from vllm_sophon.platform import get_soph_config_manager
+from vllm_sophon.hack.soph_utils import LLMQualityChecker
+from vllm_sophon.platform import get_soph_config_manager
 
 logger = init_logger(__name__)
 
@@ -179,9 +179,8 @@ def validate_and_add_requests(
 
     input_tokens_len = []
     is_multi_modal = any("multi_modal_data" in p for p in prompts)
+    tokenizer = llm_engine.tokenizer.tokenizer
     if not is_multi_modal:
-        tokenizer = llm_engine.tokenizer.tokenizer
-
         if llm_engine.tokenizer.tokenizer.chat_template is None:
             # Define a simple chat template for models like LLaMA.
             llama_template = """{% for message in messages %}{% if message['role'] == 'user' %}<s>[INST] {{ message['content'] }} [/INST]{% elif message['role'] == 'assistant' %}{{ message['content'] }}</s>{% endif %}{% endfor %}"""
@@ -202,8 +201,9 @@ def validate_and_add_requests(
     else:
         truncated_prompts = prompts
         for prompt in prompts:
-            tokens = tokenizer.encode(prompt)
-            input_tokens_len.append(len(tokens))
+            tokens = tokenizer.encode(prompt['prompt'])
+            prompt_token_len = len(tokens) + MAX_IMG_TOKEN
+            input_tokens_len.append(prompt_token_len)
 
     request_counter = Counter()
     # Add requests to the engine.
@@ -257,25 +257,23 @@ def gen_vlm_test_batch(batch_size):
             except Exception as e:
                 logger.error(f"Failed to download image: {e}")
 
-
     def gen_batch_pb(batch_size, img_pth):
         prompt_header = "A chat between a curious human and an artificial intelligence assistant. \
                         The assistant gives helpful, detailed, and polite answers to the human's questions. USER: ![]("
-
         question = "<image>What is shown in this image?ASSISTANT:"
         input_str = f"{prompt_header}{question}"
 
         from PIL import Image
         image = Image.open(img_pth)
-        prompt = [{
+        prompts = [{
                 "prompt": input_str,
                 "multi_modal_data": {"image": image},
             } for _ in range(batch_size)]
 
-        prompt = cast(Union[PromptType, Sequence[PromptType]], prompt)
-        logger.info(f'Real input text: {prompt}')
+        prompts = cast(Union[PromptType, Sequence[PromptType]], prompts)
+        logger.info(f'Real input text: {prompts}')
 
-        return prompt
+        return prompts
 
     img_pth = "dataset/images/chicken_on_money.png"
     prepare_image(img_pth)
