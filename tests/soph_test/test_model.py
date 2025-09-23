@@ -266,7 +266,7 @@ def gen_vlm_test_batch(batch_size, model_id):
             config_json = json.load(f)
         model_arch = config_json["architectures"]
         if model_arch == ['Qwen2_5_VLForConditionalGeneration'] or model_arch == ['Qwen2VLForConditionalGeneration']:
-            question = "<|im_start|>user\n<|image_pad|>\nWhat is shown in this image?<|im_end|>\n<|im_start|>assistant\n"
+            question = "<|image_pad|>What is shown in this image?ASSISTANT:"
         else:
             question = "<image>What is shown in this image?ASSISTANT:"
         input_str = f"{prompt_header}{question}"
