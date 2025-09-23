@@ -28,7 +28,7 @@ DOCKERFILE="Dockerfile.sophtpu"
 
 COMMIT_ID=$(git rev-parse --short HEAD)
 DATE=$(date +%Y%m%d)
-#TORCH_TPU_COMMIT_ID=$(ls third-party/torch-tpu* | awk -F'[_.]' '{print $(NF-2)}')
+TORCH_TPU_COMMIT_ID=$(ls third-party/torch-tpu* | awk -F'[_.]' '{print $(NF-2)}')
 
 # clean docker image
 if [ -n "$(docker images -q ${IMAGE_NAME}:${IMAGE_TAG} 2> /dev/null)" ]; then

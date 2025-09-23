@@ -43,6 +43,14 @@ COPY tests/soph_test /workspace/tests/soph_test
 #    --mount=type=bind,source=.git,target=.git \
 #    VLLM_TARGET_DEVICE=empty python3 setup.py develop
 
+COPY third-party third-party
+
+RUN cd third-party \
+ && tar -xzvf torch-tpu*.tar.gz \
+ && pip install ./dist/torch_tpu*_x86_64.whl --force-reinstall \
+ && dpkg -i ./tpuv7-runtime-emulator*_amd64.deb \
+ && rm -rf *
+
 WORKDIR /workspace/
 #RUN ln -s /workspace/vllm/tests && ln -s /workspace/vllm/examples && ln -s /workspace/vllm/benchmarks
 
