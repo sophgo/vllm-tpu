@@ -439,7 +439,7 @@ class Qwen3Model(nn.Module):
 
         self.tp_size = get_tensor_model_parallel_world_size()
         self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads // self.tp_size
+        self.num_kv_heads = config.num_key_value_heads
 
         self.mlp_buffer = None
         self.attn_buffer = None
@@ -489,7 +489,7 @@ class Qwen3Model(nn.Module):
         rms_buffer = self.rms_buffer
         attn_buffer = self.attn_buffer
         query_buffer = torch.empty(hidden_states.shape[0], self.num_heads // self.tp_size, self.head_dim).to(default_device).to(default_dtype)
-        key_buffer = torch.empty(hidden_states.shape[0], self.num_kv_heads, self.head_dim).to(default_device).to(default_dtype)
+        key_buffer = torch.empty(hidden_states.shape[0], self.num_kv_heads // self.tp_size, self.head_dim).to(default_device).to(default_dtype)
 
         block_tables = attn_metadata.block_tables
         slots = attn_metadata.slot_mapping
