@@ -1,4 +1,3 @@
-
 import os
 from typing import Dict, List, Optional
 
@@ -21,8 +20,10 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.utils import bind_kv_cache
 from vllm.distributed.parallel_state import _WORLD, init_world_group
 from vllm_sophon.platform import get_soph_config_manager
-from vllm_sophon.v1.worker.sophtpu_model_runner import ExecutionMode, SophTPUModelRunner
+from vllm_sophon.v1.worker.sophtpu_model_runner import ExecutionMode, SophTPUModelRunner, SophAttentionSpec, SophTPUAttentionBackend
 import math
+
+
 
 logger = init_logger(__name__)
 
@@ -114,28 +115,99 @@ class SophTPUWorker:
         # Init ModelRunner here, so that we have access to self.device.
         self.model_runner = SophTPUModelRunner(self.vllm_config, self.device)
 
+
+    @torch.inference_mode()
     def determine_available_memory(self) -> int:
-        '''
-        Unit: bytes
-        '''
-        max_model_len = self.model_config.max_model_len
+        """Profiles the peak memory usage of the model to determine how much
+        memory can be used for KV cache without OOMs.
 
-        num_hidden_layers = self.model_config.hf_text_config.num_hidden_layers
-        num_heads = self.model_config.get_num_kv_heads(self.parallel_config)
-        head_dim = self.model_config.get_head_size()
+        The engine will first conduct a profiling of the existing memory usage.
+        Then, it calculate the free memory that can be used for KV cache in
+        bytes.
 
-        bytes_per_elem = torch.tensor([], dtype=self.cache_dtype).element_size()
+        .. tip::
+            You may limit the usage of GPU memory
+            by adjusting the `gpu_memory_utilization` parameter.
+        """
+        kv_caches: Dict[str, torch.Tensor] = {}
+        kv_cache_spec = self.model_runner.get_kv_cache_spec()
+        for layer_name, layer_spec in kv_cache_spec.items():
+            if isinstance(layer_spec, SophAttentionSpec):
+                dtype = layer_spec.dtype
+                min_num_block = (
+                    self.scheduler_config.max_num_batched_tokens
+                    + self.cache_config.block_size
+                ) // self.cache_config.block_size
+                # dummy kv cache for profiling
+                kv_cache_shape = SophTPUAttentionBackend.get_kv_cache_shape(
+                    min_num_block, self.cache_config.block_size, 1, 1)
+                dtype = layer_spec.dtype
 
-        # NOTE: It's not a good way to estimate the memory usage using the max-num-seqs.
-        # This will cause the memory usage to be overestimated.
-        batch_size = self.vllm_config.scheduler_config.max_num_seqs
-        block_size = self.vllm_config.cache_config.block_size
-        coef = 1 if self.model_config.use_mla else 2
-        kvcache_memory = coef * num_hidden_layers * batch_size * \
-                            math.ceil(max_model_len / block_size) * block_size * \
-                                num_heads * head_dim * bytes_per_elem
-        kvcache_memory = kvcache_memory * 1.1  # Redundant memory
-        return kvcache_memory
+                if self.model_config.is_deepseek_mla:
+                    assert self.model_config.use_mla
+                    qk_rope_head_dim = getattr(self.model_config.hf_text_config, "qk_rope_head_dim", 0)
+                    kv_lora_rank = self.model_config.hf_text_config.kv_lora_rank
+                    tpu_kv_cache = torch.empty((kv_cache_shape[0], kv_cache_shape[1], kv_lora_rank),
+                                               dtype=dtype,
+                                               device=self.device)
+                    tpu_pe_cache = torch.empty((kv_cache_shape[0], kv_cache_shape[1], qk_rope_head_dim),
+                                               dtype=dtype,
+                                               device=self.device)
+
+                    kv_caches[layer_name] = (tpu_kv_cache, tpu_pe_cache)
+                else:
+                    tpu_k_cache = torch.empty(kv_cache_shape,
+                                              dtype=dtype,
+                                              device=self.device)
+                    tpu_v_cache = torch.empty_like(tpu_k_cache)
+
+                    kv_caches[layer_name] = (tpu_k_cache, tpu_v_cache)
+            else:
+                raise NotImplementedError
+
+        torch.tpu.empty_cache()
+        torch.tpu.synchronize()
+        torch.tpu.reset_peak_memory_stats()
+        _, total_gpu_memory = torch.tpu.mem_get_info()
+
+        # Execute a forward pass with dummy inputs to profile the memory usage
+        # of the model.
+        runner_kv_caches: List[torch.Tensor] = []
+        bind_kv_cache(
+            kv_caches,
+            self.vllm_config.compilation_config.static_forward_context,
+            runner_kv_caches)
+        
+        logger.info(f'---- START DUMMY RUN ----')
+
+        self.model_runner.dummy_run(
+            runner_kv_caches,
+            num_tokens=1,
+            seq_len=self.scheduler_config.max_num_batched_tokens,
+            exec_mode=ExecutionMode.PREFILL,
+        )
+
+        # Get the peak memory allocation recorded by torch
+        peak_memory = torch.tpu.memory_stats()["allocated_bytes.all.peak"]
+
+        # Check for any memory left around that may have been allocated on the
+        # gpu outside of `torch`. NCCL operations, for example, can use a few
+        # GB during a forward pass
+        torch.tpu.empty_cache()
+        torch.tpu.synchronize()
+        logger.info(f'---- FINISH DUMMY RUN ----')
+        torch_allocated_bytes = torch.tpu.memory_stats(
+        )["allocated_bytes.all.current"]
+        total_allocated_bytes = torch.tpu.mem_get_info(
+        )[1] - torch.tpu.mem_get_info()[0]
+        non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
+        if non_torch_allocations > 0:
+            peak_memory += non_torch_allocations
+        available_kv_cache_memory = (
+            total_gpu_memory * self.cache_config.gpu_memory_utilization -
+            peak_memory)
+
+        return int(available_kv_cache_memory)
 
     def execute_model(
         self,

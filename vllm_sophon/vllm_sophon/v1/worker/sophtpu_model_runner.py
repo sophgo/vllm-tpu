@@ -780,7 +780,7 @@ class SophTPUModelRunner:
                 seq_len, self.sliding_window)
             block_ids = req_state.block_ids
             start_idx = max(0, seq_len - self.sliding_window) if self.sliding_window else 0
-            
+
             # input_tokens\input_positions\cache_lengths
             input_tokens.append(generation_token)
             input_positions.append(position)
@@ -1003,7 +1003,7 @@ class SophTPUModelRunner:
         exec_mode = ExecutionMode(exec_mode)
         if exec_mode.is_prefill():
             seq_len = (seq_len + 15) // 16 * 16
-            token_ids = torch.zeros((num_tokens, seq_len),
+            token_ids = torch.zeros((seq_len),
                                     dtype=torch.int32,
                                     device=self.device)
             if self.uses_mrope:
@@ -1014,12 +1014,16 @@ class SophTPUModelRunner:
                 position_ids = mrope_positions  # 使用 M-RoPE 位置编码
             else:
                 # 普通 1D 位置编码
-                position_ids = torch.zeros((num_tokens, seq_len),
+                position_ids = torch.zeros((seq_len),
                                         dtype=torch.int32,
                                         device=self.device)
             slot_mapping = torch.zeros((num_tokens, seq_len),
-                                       dtype=torch.int64,
+                                       dtype=torch.int32,
                                        device=self.device)
+            block_tables = torch.zeros(
+                    (seq_len, self.max_num_blocks_per_req),
+                    dtype=torch.int32,
+                    device=self.device)
             if exec_mode == ExecutionMode.PREFILL:
                 attn_metadata = SophTPUMetadata(
                     num_prefills=num_tokens,
@@ -1028,9 +1032,10 @@ class SophTPUModelRunner:
                     slot_mapping=slot_mapping,
                     multi_modal_placeholder_index_maps=None,
                     enable_kv_scales_calculation=True,
-                    block_tables=None,
-                    context_lens=None,
-                    effective_query_lens=None,
+                    block_tables=block_tables,
+                    input_lengths=torch.full((num_tokens, ), seq_len,
+                                             dtype=torch.int32),
+                    cache_lengths=torch.zeros((num_tokens, ),dtype=torch.int32)
                 )
 
             else:
@@ -1102,10 +1107,10 @@ class SophTPUModelRunner:
         with set_forward_context(attn_metadata, self.vllm_config, 0):
             assert self.model is not None
             self.model(
-                token_ids,
-                position_ids,
-                kv_caches,
-                attn_metadata,
+                input_ids=token_ids,
+                positions=position_ids,
+                kv_caches=kv_caches,
+                attn_metadata=attn_metadata,
                 inputs_embeds=inputs_embeds,
             )
 
