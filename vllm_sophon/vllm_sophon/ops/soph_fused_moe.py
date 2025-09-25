@@ -87,7 +87,13 @@ class SophDeepseekV3FusedMoE(nn.Module):
             n_blocks = (rows + block_n - 1) // block_n
             k_blocks = (cols + block_k - 1) // block_k
 
-        return (output_size_per_partition, input_size_per_partition),(n_blocks, k_blocks) if block_quant else None,weight_dtype,scale_dtype
+        if block_quant:
+            scale_shape = (n_blocks, k_blocks)
+        else:
+            # For non-block quantization, use a simple 1D scale shape
+            scale_shape = (1,)
+
+        return (output_size_per_partition, input_size_per_partition), scale_shape, weight_dtype, scale_dtype
 
     def create_weight(self):
         block_quant = hasattr(self.quant_config, 'weight_block_size')
@@ -101,26 +107,16 @@ class SophDeepseekV3FusedMoE(nn.Module):
         down_weight_shape, down_scale_shape, down_weight_dtype, down_scale_dtype = down_shape_info
 
         gate_weights = torch.nn.Parameter(torch.empty(self.n_routed_experts, *gate_weight_shape, dtype=gate_weight_dtype),requires_grad=False)
-        gate_scales = torch.nn.Parameter(torch.empty(self.n_routed_experts, *gate_scale_shape, dtype=gate_scale_dtype),requires_grad=False)
         up_weights = torch.nn.Parameter(torch.empty(self.n_routed_experts, *up_weight_shape, dtype=up_weight_dtype),requires_grad=False)
-        up_scales = torch.nn.Parameter(torch.empty(self.n_routed_experts, *up_scale_shape, dtype=up_scale_dtype),requires_grad=False)
         down_weights = torch.nn.Parameter(torch.empty(self.n_routed_experts, *down_weight_shape, dtype=down_weight_dtype),requires_grad=False)
-        down_scales = torch.nn.Parameter(torch.empty(self.n_routed_experts, *down_scale_shape, dtype=down_scale_dtype),requires_grad=False)
 
         self.register_parameter("gate_weights", gate_weights)
         set_weight_attrs(gate_weights, {
             "quant_method": "BLOCK" if block_quant else "TENSOR",
             "output_dim": 0,
             "is_sharded_weight": True,
-            "weight_loader": self.weight_loader
-        })
-
-        self.register_parameter("gate_scales", gate_scales)
-        set_weight_attrs(gate_scales, {
-            "quant_method": "BLOCK" if block_quant else "TENSOR",
-            "output_dim": 0,
-            "is_sharded_weight": True,
-            "weight_loader": self.weight_loader
+            "weight_loader": self.weight_loader,
+            "proj_type": "gate_proj"
         })
 
         self.register_parameter("up_weights", up_weights)
@@ -128,15 +124,8 @@ class SophDeepseekV3FusedMoE(nn.Module):
             "quant_method": "BLOCK" if block_quant else "TENSOR",
             "output_dim": 0,
             "is_sharded_weight": True,
-            "weight_loader": self.weight_loader
-        })
-
-        self.register_parameter("up_scales", up_scales)
-        set_weight_attrs(up_scales, {
-            "quant_method": "BLOCK" if block_quant else "TENSOR",
-            "output_dim": 0,
-            "is_sharded_weight": True,
-            "weight_loader": self.weight_loader
+            "weight_loader": self.weight_loader,
+            "proj_type": "up_proj"
         })
 
         self.register_parameter("down_weights", down_weights)
@@ -144,20 +133,61 @@ class SophDeepseekV3FusedMoE(nn.Module):
             "quant_method": "BLOCK" if block_quant else "TENSOR",
             "output_dim": 1 ,
             "is_sharded_weight": True,
-            "weight_loader": self.weight_loader
+            "weight_loader": self.weight_loader,
+            "proj_type": "down_proj"
         })
 
-        self.register_parameter("down_scales", down_scales)
-        set_weight_attrs(down_scales, {
-            "quant_method": "BLOCK" if block_quant else "TENSOR",
-            "output_dim": 1 ,
-            "is_sharded_weight": True,
-            "weight_loader": self.weight_loader
-        })
+        if block_quant:
+            gate_scales = torch.nn.Parameter(torch.empty(self.n_routed_experts, *gate_scale_shape, dtype=gate_scale_dtype),requires_grad=False)
+            up_scales = torch.nn.Parameter(torch.empty(self.n_routed_experts, *up_scale_shape, dtype=up_scale_dtype),requires_grad=False)
+            down_scales = torch.nn.Parameter(torch.empty(self.n_routed_experts, *down_scale_shape, dtype=down_scale_dtype),requires_grad=False)
+
+            self.register_parameter("gate_scales", gate_scales)
+            set_weight_attrs(gate_scales, {
+                "quant_method": "BLOCK",
+                "output_dim": 0,
+                "is_sharded_weight": True,
+                "weight_loader": self.weight_loader,
+                "proj_type": "gate_proj"
+            })
+
+            self.register_parameter("up_scales", up_scales)
+            set_weight_attrs(up_scales, {
+                "quant_method": "BLOCK",
+                "output_dim": 0,
+                "is_sharded_weight": True,
+                "weight_loader": self.weight_loader,
+                "proj_type": "up_proj"
+            })
+
+            self.register_parameter("down_scales", down_scales)
+            set_weight_attrs(down_scales, {
+                "quant_method": "BLOCK",
+                "output_dim": 1 ,
+                "is_sharded_weight": True,
+                "weight_loader": self.weight_loader,
+                "proj_type": "down_proj"
+            })
 
     @classmethod
     def make_expert_params_mapping(
-            cls, num_experts: int) -> List[Tuple[str, str, int]]:
+            cls, num_experts: int, has_quantization: bool = True) -> List[Tuple[str, str, int]]:
+
+        if has_quantization:
+            weight_names = [
+                'gate_proj.weight',
+                'gate_proj.weight_scale_inv',
+                'up_proj.weight',
+                'up_proj.weight_scale_inv',
+                'down_proj.weight',
+                'down_proj.weight_scale_inv',
+            ]
+        else:
+            weight_names = [
+                'gate_proj.weight',
+                'up_proj.weight',
+                'down_proj.weight'
+            ]
 
         return [
             # (param_name, weight_name, expert_id)
@@ -170,14 +200,7 @@ class SophDeepseekV3FusedMoE(nn.Module):
                 f"experts.{expert_id}.{weight_name}",
                 expert_id
             )
-            for expert_id in range(num_experts) for weight_name in [
-                'gate_proj.weight',
-                'gate_proj.weight_scale_inv',
-                'up_proj.weight',
-                'up_proj.weight_scale_inv',
-                'down_proj.weight',
-                'down_proj.weight_scale_inv'
-            ]
+            for expert_id in range(num_experts) for weight_name in weight_names
         ]
 
     def weight_loader(self, loaded_weight, param, expert_id):
@@ -200,14 +223,19 @@ class SophDeepseekV3FusedMoE(nn.Module):
     def process_weights_after_loading(self, *prefix):
 
         self.gate_weights.data = soph_to_dtype(self.gate_weights.data, self.params_dtype)
-        self.gate_scales.data = soph_to_dtype(self.gate_scales.data, self.params_dtype)
         self.up_weights.data = soph_to_dtype(self.up_weights.data, self.params_dtype)
-        self.up_scales.data = soph_to_dtype(self.up_scales.data, self.params_dtype)
         self.down_weights.data = soph_to_dtype(self.down_weights.data, self.params_dtype)
-        self.down_scales.data = soph_to_dtype(self.down_scales.data, self.params_dtype)
+
+        if hasattr(self, 'gate_scales'):
+            self.gate_scales.data = soph_to_dtype(self.gate_scales.data, self.params_dtype)
+        if hasattr(self, 'up_scales'):
+            self.up_scales.data = soph_to_dtype(self.up_scales.data, self.params_dtype)
+        if hasattr(self, 'down_scales'):
+            self.down_scales.data = soph_to_dtype(self.down_scales.data, self.params_dtype)
 
         self.down_weights.data = self.down_weights.data.transpose(1,2).contiguous()
-        self.down_scales.data = self.down_scales.data.transpose(1,2).contiguous()
+        if hasattr(self, 'down_scales'):
+            self.down_scales.data = self.down_scales.data.transpose(1,2).contiguous()
 
     def forward(self, gathered_experts_out_buf, x,
                 output_sample, input_sample,
@@ -216,10 +244,15 @@ class SophDeepseekV3FusedMoE(nn.Module):
                 selected_experts_middle, routing_weights_middle,
                 block_size, num_experts, num_experts_per_tok,
                 use_grouped_topk, num_expert_group, topk_group,):
+
+        gate_scales = getattr(self, 'gate_scales', None)
+        up_scales = getattr(self, 'up_scales', None)
+        down_scales = getattr(self, 'down_scales', None)
+
         torch.ops.my_ops.fused_moe_fused_experts(gathered_experts_out_buf, x,
                                                 output_sample, input_sample,
                                                 self.gate_weights, self.up_weights, self.down_weights,
-                                                self.gate_scales, self.up_scales, self.down_scales,
+                                                gate_scales, up_scales, down_scales,
                                                 selected_experts, routing_weights,
                                                 num_select_experts,
                                                 selected_experts_middle, routing_weights_middle,
