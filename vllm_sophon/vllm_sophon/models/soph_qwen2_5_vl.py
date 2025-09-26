@@ -1043,8 +1043,18 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                 f"Attempted to assign {flattened.shape[0]} multimodal tokens "
                 f"to {num_expected_tokens} placeholders")
 
-        # Perform the merge
-        inputs_embeds[is_multimodal] = flattened
+        #improve performence
+        diffs = is_multimodal[1:].int() - is_multimodal[:-1].int()
+        starts = torch.where(diffs == 1)[0]
+        ends = torch.where(diffs == -1)[0]
+        if len(starts) != len(ends):
+            inputs_embeds[is_multimodal] = flattened.view(-1, flattened.shape[-1])
+        else:
+            current_ptr = 0
+            for start_idx, end_idx in zip(starts, ends):
+                region_length = end_idx - start_idx
+                inputs_embeds[start_idx+1:end_idx+1] = flattened[current_ptr:current_ptr + region_length]
+                current_ptr += region_length
         return inputs_embeds
 
     def _merge_multimodal_embeddings_wrapper(
