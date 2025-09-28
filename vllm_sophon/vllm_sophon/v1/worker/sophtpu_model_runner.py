@@ -496,6 +496,11 @@ class SophTPUModelRunner:
         grouped_mm_inputs_list = group_mm_inputs_by_modality(mm_inputs)
         encoder_outputs = []
         for grouped_mm_inputs in grouped_mm_inputs_list:
+            #本来在cpu上，放到tpu上，优化单芯多batch性能
+            grouped_mm_inputs = [
+                {k: v.to(self.device) for k, v in mm_input.items()}
+                for mm_input in grouped_mm_inputs
+            ]
             batched_mm_inputs = MultiModalKwargs.batch(grouped_mm_inputs)
             batched_mm_inputs = MultiModalKwargs.as_kwargs(
                 batched_mm_inputs,
