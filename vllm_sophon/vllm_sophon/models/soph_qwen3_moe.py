@@ -371,7 +371,7 @@ class Qwen3MoeAttention(nn.Module):
         key,
     ) -> torch.Tensor:
         # Project the hidden states to QKV
-        qkv, _ = self.qkv_proj(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states, attn_output[0])
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q = q.view(-1, self.num_heads, self.head_dim).contiguous()
@@ -410,7 +410,7 @@ class Qwen3MoeAttention(nn.Module):
 
         # Reshape output from multi-head format to flattened format and apply o_proj
         # Ensure output_buffer is contiguous before reshaping to avoid shape mismatch in TPU operations
-        out, _ = self.o_proj(attn_output[1].view(-1, self.num_heads * self.head_dim))
+        out, _ = self.o_proj(attn_output[1].view(-1, self.num_heads * self.head_dim), attn_output[2])
         return out
 
 
