@@ -552,24 +552,30 @@ class Qwen2_5_VisionTransformer(nn.Module):
     def rot_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
         pos_ids = []
         for t, h, w in grid_thw:
-            hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
-            wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+            h_scalar = h.item()
+            w_scalar = w.item()
+            spatial_merge_size = self.spatial_merge_size
+            hpos_ids = torch.arange(h_scalar, device=h.device).unsqueeze(1).expand(-1, w_scalar)
+            wpos_ids = torch.arange(w_scalar, device=w.device).unsqueeze(0).expand(h_scalar, -1)
             hpos_ids = hpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
+                h_scalar // spatial_merge_size,
+                spatial_merge_size,
+                w_scalar // spatial_merge_size,
+                spatial_merge_size,
             ).permute(0, 2, 1, 3).flatten()
+        
             wpos_ids = wpos_ids.reshape(
-                h // self.spatial_merge_size,
-                self.spatial_merge_size,
-                w // self.spatial_merge_size,
-                self.spatial_merge_size,
+                h_scalar // spatial_merge_size,
+                spatial_merge_size,
+                w_scalar // spatial_merge_size,
+                spatial_merge_size,
             ).permute(0, 2, 1, 3).flatten()
+            
             pos_ids.append(
-                torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1))
+                torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t.item(), 1)
+            )
         pos_ids = torch.cat(pos_ids, dim=0)
-        max_grid_size = grid_thw[:, 1:].max()
+        max_grid_size = grid_thw[:, 1:].float().max().to(dtype=torch.int32)
         rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
         pos_ids = pos_ids.to(rotary_pos_emb_full.device)
         rotary_pos_emb = rotary_pos_emb_full[pos_ids].flatten(1)
@@ -583,8 +589,11 @@ class Qwen2_5_VisionTransformer(nn.Module):
                                   self.spatial_merge_size // self.patch_size)
 
         for grid_t, grid_h, grid_w in grid_thw:
-            llm_grid_h = grid_h // self.spatial_merge_size
-            llm_grid_w = grid_w // self.spatial_merge_size
+            grid_h_scalar = grid_h.item()
+            grid_w_scalar = grid_w.item()
+            spatial_merge_size = self.spatial_merge_size
+            llm_grid_h = grid_h_scalar // spatial_merge_size
+            llm_grid_w = grid_w_scalar // spatial_merge_size
             index = torch.arange(grid_t * llm_grid_h * llm_grid_w).reshape(
                 grid_t, llm_grid_h, llm_grid_w)
             pad_h = vit_merger_window_size - llm_grid_h % vit_merger_window_size
@@ -649,9 +658,8 @@ class Qwen2_5_VisionTransformer(nn.Module):
         sin = rotary_pos_emb.sin().to(hidden_states.dtype).unsqueeze(1).repeat(1, 1, 2).unsqueeze(0)
 
         # compute cu_seqlens
-        cu_seqlens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2],
-                                             grid_thw[:, 0]).cumsum(
-                                                 dim=0, dtype=torch.int32)
+        values = grid_thw[:, 1] * grid_thw[:, 2]
+        cu_seqlens = values.cumsum(dim=0)
 
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
 
@@ -931,7 +939,6 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
         grid_thw = image_input["image_grid_thw"]
         assert grid_thw.ndim == 2
-        grid_thw = grid_thw.to('cpu')
 
         if image_input["type"] == "image_embeds":
             image_embeds = image_input["image_embeds"].type(self.visual.dtype)
@@ -941,7 +948,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
 
         # Split concatenated embeddings for each image item.
         merge_size = self.visual.spatial_merge_size
-        sizes = grid_thw.prod(-1) // merge_size // merge_size
+        sizes = []
+        for grid_t, grid_h, grid_w in grid_thw:
+            # 将 Tensor 转换为标量后再计算
+            t, h, w = grid_t.item(), grid_h.item(), grid_w.item()
+            size = (t * h * w) // (merge_size * merge_size)
+            sizes.append(size)
+        sizes = torch.tensor(sizes, dtype=torch.int32, device=grid_thw.device)
 
         return image_embeds.split(sizes.tolist())
 
