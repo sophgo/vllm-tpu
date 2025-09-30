@@ -90,12 +90,11 @@ class SophTpuPlatform(Platform):
 
         compilation_config = vllm_config.compilation_config
 
-        if compilation_config.level != CompilationLevel.DYNAMO_ONCE:
-            logger.info("[Sophon TPU] Forcing DYNAMO_ONCE compilation level")
-            compilation_config.level = CompilationLevel.DYNAMO_ONCE
-
-        if compilation_config.backend == "":
-            compilation_config.backend = "torch-tpu"
+        if compilation_config and compilation_config.level != CompilationLevel.NO_COMPILATION:
+            logger.warning(
+                "Compilation level %s is not supported on TPU now, forcing compilation level to NO_COMPILATION",
+                compilation_config.level)
+            compilation_config.level = CompilationLevel.NO_COMPILATION
 
         assert vllm_config.speculative_config is None, \
             "Sophon TPU does not support speculative decoding"
