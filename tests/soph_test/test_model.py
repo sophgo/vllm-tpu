@@ -112,6 +112,13 @@ def parse_args():
         required=True,
         help="Tensor Parallel size. Set to 1 to disable tensor parallel.")
 
+    parser.add_argument(
+        "--image-size",
+        type=str,
+        default=None,
+        help="Resize input image to specified size (e.g., 224x224, 448x640). If not set, use original image size."
+    )
+
     args = parser.parse_args()
 
     if args.mode == "chat" and "--input-length" in sys.argv:
@@ -242,7 +249,7 @@ def gen_test_case(batch_size, chat: False):
 
     return questions
 
-def gen_vlm_test_batch(batch_size, model_id):
+def gen_vlm_test_batch(batch_size, model_id, image_size = None):
     def prepare_image(img_pth):
         if not os.path.exists(img_pth):
             try:
@@ -273,6 +280,13 @@ def gen_vlm_test_batch(batch_size, model_id):
 
         from PIL import Image
         image = Image.open(img_pth)
+        if image_size:
+            try:
+                width, height = map(int, image_size.split('x'))
+                image = image.resize((width, height), Image.Resampling.LANCZOS)
+                logger.info(f"Image resized to {width}x{height}")
+            except ValueError:
+                logger.warning(f"Invalid image size format: {image_size}. Using original image size.")
         prompts = [{
                 "prompt": input_str,
                 "multi_modal_data": {"image": image},
@@ -289,16 +303,16 @@ def gen_vlm_test_batch(batch_size, model_id):
 
     return batch_pb
 
-def init_batch_prompt(is_multi_modal, batches, chat_mode, model_id):
+def init_batch_prompt(is_multi_modal, batches, chat_mode, model_id, image_size = None):
     if is_multi_modal:
-        next_batch = gen_vlm_test_batch(batches, model_id)
+        next_batch = gen_vlm_test_batch(batches, model_id, image_size)
     else:
         next_batch = gen_test_case(batches, chat_mode)
     return next_batch
 
 def test_whole_model(
     model_id, dtype, batch, input_length, max_new_tokens, chat_mode:bool = False, quality_check:bool = False,
-    use_v1:bool = True, tp_size:int=1
+    use_v1:bool = True, tp_size:int = 1, image_size = None
 ):
     prof = None
     profile_starting_token = soph_config_manager.get("PROFILE_STARTING_TOKEN")
@@ -314,7 +328,7 @@ def test_whole_model(
         max_new_tokens=max_new_tokens, input_length=input_length, tp_size=tp_size
     )
 
-    prompts = init_batch_prompt(is_multi_modal, batch, chat_mode, model_id)
+    prompts = init_batch_prompt(is_multi_modal, batch, chat_mode, model_id, image_size)
 
     for repeat_i in range(2):
         logger.warning(f'================================ Run iter: {repeat_i + 1} ================================')
@@ -461,7 +475,8 @@ if __name__ == "__main__":
         chat_mode=args.mode == "chat",
         quality_check=args.quality_check,
         use_v1=args.useV1,
-        tp_size=args.tp_size
+        tp_size=args.tp_size,
+        image_size=args.image_size
     )
     # 保存JSON结果 - Save JSON results
     if args.save_json:
@@ -552,6 +567,7 @@ if __name__ == "__main__":
 --input-length: 可选参数，若指定，输入token将被填充为该长度。
 --max-new-tokens: 可选参数，指定要生成的最大token数，默认值为 128。
 --mode: 可选参数，指定运行模式，可选值为 chat 和 generate，默认值为 generate。
+--image-size: 可选参数，调整输入图片尺寸(例如:224x224, 448x640)。如不设置，使用原始图片尺寸。
 --quality-check: 可选参数，模型生成文本质量检查，如果设置该参数则需要提供SophNet API_KEY。
 --save-json: 可选参数，指定该参数后，测试结果将保存至 JSON 文件中。
 --save-results: 可选参数，指定该参数后，测试结果将保存至 results_{RANK}.csv 文件中。
