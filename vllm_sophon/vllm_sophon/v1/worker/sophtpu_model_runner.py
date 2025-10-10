@@ -1003,17 +1003,17 @@ class SophTPUModelRunner:
         exec_mode = ExecutionMode(exec_mode)
         if exec_mode.is_prefill():
             seq_len = (seq_len + 15) // 16 * 16
-            token_ids = torch.zeros((seq_len),
+            token_ids = torch.zeros((num_tokens * seq_len),
                                     dtype=torch.int32,
                                     device=self.device)
-            position_ids = torch.zeros((seq_len),
+            position_ids = torch.zeros((num_tokens * seq_len),
                                         dtype=torch.int32,
                                         device=self.device)
-            slot_mapping = torch.zeros((num_tokens, seq_len),
+            slot_mapping = torch.zeros((num_tokens * seq_len),
                                        dtype=torch.int32,
                                        device=self.device)
             block_tables = torch.zeros(
-                    (seq_len, self.max_num_blocks_per_req),
+                    (num_tokens, self.max_num_blocks_per_req),
                     dtype=torch.int32,
                     device=self.device)
             if exec_mode == ExecutionMode.PREFILL:
@@ -1055,13 +1055,13 @@ class SophTPUModelRunner:
                 )
         else:
             assert seq_len == 1
-            token_ids = torch.zeros((num_tokens, seq_len),
+            token_ids = torch.zeros((num_tokens * seq_len),
                                     dtype=torch.int32,
                                     device=self.device)
-            position_ids = torch.zeros((num_tokens, seq_len),
+            position_ids = torch.zeros((num_tokens * seq_len),
                                          dtype=torch.int32,
                                          device=self.device)
-            slot_mapping = torch.zeros((num_tokens, seq_len),
+            slot_mapping = torch.zeros((num_tokens * seq_len),
                                        dtype=torch.int64,
                                        device=self.device)
             block_tables = torch.zeros(
