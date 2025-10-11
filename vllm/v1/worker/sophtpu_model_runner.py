@@ -1021,21 +1021,9 @@ class SophTPUModelRunner:
             token_ids = torch.zeros((num_tokens, seq_len),
                                     dtype=torch.int32,
                                     device=self.device)
-            # position_ids = torch.zeros((num_tokens, seq_len),
-            #                            dtype=torch.int32,
-            #                            device=self.device)
-            # 初始化 M-RoPE 位置编码（如果是多模态模型）
-            if self.uses_mrope:
-                # M-RoPE 需要 3 维位置编码（如 height, width, text_pos）
-                mrope_positions = torch.zeros((3, num_tokens, seq_len),
-                                            dtype=torch.int32,
-                                            device=self.device)
-                position_ids = mrope_positions  # 使用 M-RoPE 位置编码
-            else:
-                # 普通 1D 位置编码
-                position_ids = torch.zeros((num_tokens, seq_len),
-                                        dtype=torch.int32,
-                                        device=self.device)
+            position_ids = torch.zeros((num_tokens, seq_len),
+                                       dtype=torch.int32,
+                                       device=self.device)
             slot_mapping = torch.zeros((num_tokens, seq_len),
                                        dtype=torch.int64,
                                        device=self.device)
@@ -1080,20 +1068,9 @@ class SophTPUModelRunner:
             token_ids = torch.zeros((num_tokens, seq_len),
                                     dtype=torch.int32,
                                     device=self.device)
-            # position_ids = torch.zeros((num_tokens, seq_len),
-            #                            dtype=torch.int32,
-            #                            device=self.device)
-            # 初始化位置编码（Decode 阶段）
-            if self.uses_mrope:
-                # M-RoPE 需要 3 维位置编码（如 height, width, text_pos）
-                position_ids = torch.zeros((3, num_tokens, seq_len),
-                                         dtype=torch.int32,
-                                         device=self.device)
-            else:
-                # 普通 1D 位置编码
-                position_ids = torch.zeros((num_tokens, seq_len),
-                                         dtype=torch.int32,
-                                         device=self.device)
+            position_ids = torch.zeros((num_tokens, seq_len),
+                                       dtype=torch.int32,
+                                       device=self.device)
             slot_mapping = torch.zeros((num_tokens, seq_len),
                                        dtype=torch.int64,
                                        device=self.device)
