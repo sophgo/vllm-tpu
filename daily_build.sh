@@ -40,12 +40,12 @@ docker build --build-arg PIP_INDEX_URL=${PIP_INDEX_URL} -f ${DOCKERFILE} -t ${IM
 docker save ${IMAGE_NAME}:${IMAGE_TAG} | bzip2 > docker-${IMAGE_NAME}-${IMAGE_TAG}-${DATE}-${COMMIT_ID}-${TORCH_TPU_COMMIT_ID}.tar.bz2
 
 # Build docs
-#DOCKER_IMG_PANDOC=${IMAGE_NAME}:${IMAGE_TAG}
-#DOCKER_IMG_DOCUMENT=sophgo/torch_tpu:latest
+DOCKER_IMG_PANDOC=${IMAGE_NAME}:${IMAGE_TAG}
+DOCKER_IMG_DOCUMENT=sophgo/torch_tpu:latest
 
-#docker run --entrypoint bash --rm -v $(pwd):/workspace/ $DOCKER_IMG_PANDOC -c 'cd /workspace && pandoc --from=markdown --to=rst --output=sophgo_docs/source_zh/readme.rst README.md'
+docker run --entrypoint bash --rm -v $(pwd):/workspace/ $DOCKER_IMG_PANDOC -c 'cd /workspace && pandoc --from=markdown --to=rst --output=sophgo_docs/source_zh/readme.rst README_sophtpu.md'
 # pandoc --from=markdown --to=rst --output=sophgo_docs/source_zh/readme.rst README.md
-#docker run --rm -v $(pwd):/workspace/ $DOCKER_IMG_DOCUMENT /bin/bash -c 'cd sophgo_docs/ && make pdf LANG=zh'
+docker run --rm -v $(pwd):/workspace/ $DOCKER_IMG_DOCUMENT /bin/bash -c 'cd sophgo_docs/ && make pdf LANG=zh'
 
 # clean docker iamge
 if docker images -q ${IMAGE_NAME}:${IMAGE_TAG}; then

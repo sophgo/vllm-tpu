@@ -5,7 +5,7 @@
 ### Release 地址
 
 vLLM项目代码、docker镜像、主要模型权重/数据集等资源在 FTP 服务器上存放路径：
-`ftp://172.28.141.89/LLMs/vLLM
+`ftp://172.28.141.89/LLMs/vLLM`
 
 ### 模型支持列表
 
@@ -38,6 +38,7 @@ vLLM项目代码、docker镜像、主要模型权重/数据集等资源在 FTP �
 ### 准备模型权重
 
 从[Hugging Face](https://huggingface.co/models)、[ModelScope](https://modelscope.cn/models)、[gitee AI](https://ai.gitee.com/models) 等社区下载模型权重到本地。
+
 > *注意*：对于量化模型，我们会在初次运行该模型时对模型权重进行重排处理，处理后的模型保存在`/data/.reorder_cache/<MODEL_NAME>`中。由于版本的升级，权重处理逻辑可能会发生改变，因此在更新vLLM版本时应该删除重排的权重文件目录以便于重新生成。
 
 
