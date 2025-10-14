@@ -683,7 +683,7 @@ class TestModelRunner:
             ),
             quality=CaseResult.Quality(),
             inference_data=CaseResult.Texts(
-                text_input=prompts,
+                text_input=str(prompts),
                 text_generated=dict(generated_text),
                 real_input_len=input_tokens_len,
                 real_output_len=generated_tokens_len,
