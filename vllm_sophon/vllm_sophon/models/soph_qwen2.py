@@ -33,19 +33,22 @@ from vllm.attention import Attention, AttentionMetadata, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, ParallelConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.pooler import Pooler, PoolingType
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.tpu.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
-from vllm.model_executor.pooling_metadata import PoolingMetadata
-from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.sequence import IntermediateTensors, PoolerOutput
+from vllm.v1.pool.metadata import PoolingMetadata
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import PoolerOutput
 
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (AutoWeightsLoader,
@@ -61,6 +64,7 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_reduce)
 from vllm.model_executor.models.qwen2 import Qwen2Attention
 
+from vllm_sophon.attention.attention import SophTPUMetadata
 from vllm_sophon.ops.soph_linear import (SophQKVParallelLinear,
                                          SophColumnParallelLinear,
                                          SophRowParallelLinear)
@@ -144,6 +148,7 @@ class SophonQwen2Attention(Qwen2Attention):
                          rope_theta, cache_config, quant_config, \
                          rope_scaling, prefix, attn_type)
 
+        self.attn_metadata_prefix = f"{prefix}.attn"
         self.qkv_proj = SophQKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -163,23 +168,27 @@ class SophonQwen2Attention(Qwen2Attention):
 
     def forward(
         self,
-        #positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: AttentionMetadata
+        attention_output: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states, attn_metadata.buffer['qkv_proj_out'])
+        qkv, _ = self.qkv_proj(hidden_states, attention_output[0])
         query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         query = query.view(-1, self.num_heads, self.head_dim)
         key = key.view(-1, self.num_kv_heads, self.head_dim)
         value = value.view(-1, self.num_kv_heads, self.head_dim)
 
-        attn_out = self.attn(query, key, value, kv_cache, attn_metadata)
-
-        # Reshape the output tensor.
-        output, _ = self.o_proj(attn_out.view(-1, self.num_heads * self.head_dim), \
-                                attn_metadata.buffer['o_proj_out'])
+        attn_metadata = get_forward_context().attn_metadata
+        if attn_metadata is not None:
+            attn_metadata = attn_metadata[self.attn_metadata_prefix]
+            assert isinstance(attn_metadata, SophTPUMetadata)
+            attn_metadata.cos = cos
+            attn_metadata.sin = sin
+            attn_metadata.buffer = attention_output[1]
+            attn_out = self.attn(query, key, value)
+        output, _ = self.o_proj(attention_output[1].view(-1, self.num_heads * self.head_dim), attention_output[2])
 
         return output
 
@@ -239,15 +248,16 @@ class Qwen2DecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
         residual: Optional[torch.Tensor],
-        attn_metadata: AttentionMetadata,
+        attn_buffer: torch.Tensor,
         mlp_buffer: torch.Tensor,
         rms_buffer: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = self.input_layernorm(hidden_states, rms_buffer, residual)
 
-        attn_output = self.self_attn(hidden_states, kv_cache, attn_metadata)
+        attn_output = self.self_attn(hidden_states, attn_buffer, cos, sin)
 
         hidden_states, residual = self.post_attention_layernorm(attn_output, rms_buffer, residual)
 
@@ -344,8 +354,6 @@ class Qwen2Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
@@ -367,29 +375,24 @@ class Qwen2Model(nn.Module):
         if self.mlp_buffer is None or hidden_states.shape[0] != self.mlp_buffer.shape[0]:
             self.mlp_buffer = torch.empty_like(hidden_states)
             self.rms_buffer = torch.empty_like(hidden_states)
+            self.attn_buffer = []
+            self.attn_buffer.append(hidden_states.new_empty(hidden_states.shape[0], (self.num_heads + 2 * self.num_kv_heads) * self.head_dim // self.tp_size))
+            self.attn_buffer.append(hidden_states.new_empty((hidden_states.shape[0], self.num_heads // self.tp_size, self.head_dim)))
+            self.attn_buffer.append(torch.empty_like(hidden_states))
         mlp_buffer = self.mlp_buffer
         rms_buffer = self.rms_buffer
-
-        seqlen = hidden_states.shape[0]
-        if attn_metadata.buffer is None or attn_metadata.buffer['attn_out'].shape[0] != seqlen:
-            attn_metadata.buffer = {}
-            attn_metadata.buffer['qkv_proj_out'] = \
-                hidden_states.new_empty(seqlen, (self.num_heads + 2 * self.num_kv_heads) * self.head_dim // self.tp_size)
-            attn_metadata.buffer['attn_out'] = \
-                hidden_states.new_empty(seqlen, self.num_heads // self.tp_size, self.head_dim)
-            attn_metadata.buffer['o_proj_out'] = torch.empty_like(hidden_states)
-        attn_metadata.cos = cos
-        attn_metadata.sin = sin
+        attn_buffer = self.attn_buffer
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 hidden_states,
-                kv_caches[i - self.start_layer],
                 residual,
-                attn_metadata,
+                attn_buffer,
                 mlp_buffer,
                 rms_buffer,
+                cos,
+                sin,
             )
 
         if not get_pp_group().is_last_rank:
@@ -526,7 +529,7 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             self.lm_head = PPMissingLayer()
 
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = get_sampler()
+        self.sampler = Sampler()
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
@@ -538,24 +541,21 @@ class Qwen2ForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        kv_caches: List[torch.Tensor],
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata, intermediate_tensors,
+        hidden_states = self.model(input_ids,
+                                   positions,
+                                   intermediate_tensors,
                                    inputs_embeds)
         return hidden_states
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
         self.logits_processor.use_all_gather = True
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
     def sample(

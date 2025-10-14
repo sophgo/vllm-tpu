@@ -47,3 +47,7 @@ jinja2
 
 # Dependencies for Sophon TPUs
 # ray[default] >= 2.9
+
+# Required for N-gram speculative decoding
+numba
+

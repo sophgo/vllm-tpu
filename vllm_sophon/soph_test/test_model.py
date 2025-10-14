@@ -551,16 +551,16 @@ class TestModelRunner:
         )
         if self.is_multi_modal:
             prompts, input_tokens_len = RequestVLMChat(
-                self.engine.tokenizer.tokenizer,
+                self.engine.tokenizer,
                 getattr(self.engine.model_config.hf_config, "architectures", []),
             ).gen_test_prompts(batch_size, image_size)
         elif mode == ReqMode.CHAT:
             prompts, input_tokens_len = RequestLMChat(
-                self.engine.tokenizer.tokenizer
+                self.engine.tokenizer
             ).gen_test_prompts(batch_size, input_length)
         else:
             prompts, input_tokens_len = RequestLMGenerate(
-                self.engine.tokenizer.tokenizer
+                self.engine.tokenizer
             ).gen_test_prompts(batch_size, input_length)
 
         for repeat_i in range(2):
@@ -572,7 +572,7 @@ class TestModelRunner:
                 max_tokens=max_new_tokens, temperature=0, ignore_eos=True
             )
             lora_request = None
-            prompt_adapter_request = None
+            #prompt_adapter_request = None
             priority = None
 
             request_counter = Counter()
@@ -592,7 +592,7 @@ class TestModelRunner:
                         if isinstance(lora_request, Sequence)
                         else lora_request
                     ),
-                    prompt_adapter_request=prompt_adapter_request,
+                    #prompt_adapter_request=prompt_adapter_request,
                     priority=priority[i] if priority else 0,
                 )
                 input_text[request_id] = prompt
@@ -715,6 +715,7 @@ if __name__ == "__main__":
         args.batch, args.input_length, args.max_new_tokens, mode
     )
 
+    """
     if args.save_json:
         abs_dir = os.path.dirname(os.path.abspath(args.save_json))
         os.makedirs(abs_dir, exist_ok=True)
@@ -740,3 +741,4 @@ if __name__ == "__main__":
         logger.info(f"Results saved to {output_file}")
     if args.save_results:
         result.save_csv(f"results_{args.tp_size}.csv")
+    """

@@ -29,21 +29,24 @@ from torch import nn
 from transformers import LlamaConfig
 
 from vllm.attention import Attention, AttentionMetadata, AttentionType
+from vllm.attention.layers.encoder_only_attention import EncoderOnlyAttention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.sampler import Sampler
 
 from vllm.model_executor.models.interfaces import SupportsLoRA, SupportsPP
 from vllm.model_executor.models.utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
@@ -54,24 +57,12 @@ from vllm.distributed import (divide, get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
 
+from vllm_sophon.attention.attention import SophTPUMetadata
 from vllm_sophon.ops.soph_linear import (SophColumnParallelLinear,
                                          SophQKVParallelLinear,
                                          SophRowParallelLinear)
 from vllm_sophon.ops.soph_embedding import SophEmbedding
-
-def soph_rmsnorm(weight, output, hidden_states, variance_epsilon, residual=None):
-    if residual is not None:
-        hidden_states += residual
-    residual = hidden_states
-    torch.ops.my_ops.rmsnorm_forward(
-        hidden_states,
-        weight,
-        None,
-        output,
-        hidden_states.dim() - 1,
-        variance_epsilon,
-    )
-    return residual
+from vllm_sophon.ops.layernorm import SophonRMSNorm
 
 class LlamaMLP(nn.Module):
 
@@ -147,6 +138,7 @@ class LlamaAttention(nn.Module):
                  prefix: str = "",
                  attn_type: str = AttentionType.DECODER) -> None:
         super().__init__()
+
         self.hidden_size = hidden_size
         tp_size = get_tensor_model_parallel_world_size()
         self.total_num_heads = num_heads
@@ -166,8 +158,8 @@ class LlamaAttention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
-        self.rope_theta = rope_theta
 
+        self.attn_metadata_prefix = f"{prefix}.attn"
         self.qkv_proj = SophQKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -185,40 +177,26 @@ class LlamaAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=max_position,
-            base=self.rope_theta,
-            rope_scaling=rope_scaling,
-        )
+        attn_cls = (EncoderOnlyAttention
+                    if attn_type == AttentionType.ENCODER_ONLY else Attention)
 
-        # SophTPU Attention may not need，just use native Attention to init metadata
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_kv_heads,
-                              cache_config=cache_config,
-                              quant_config=quant_config,
-                              prefix=f"{prefix}.attn",
-                              attn_type=attn_type)
+        self.attn = attn_cls(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            attn_type=attn_type,
+            prefix=f"{prefix}.attn",
+        )
 
     def forward(
         self,
-        #positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        cos,
-        sin,
-        kv_cache: torch.Tensor,
-        block_tables,
-        slots,
-        input_lengths,
-        cache_lengths,
-        prompt_lengths,
-        max_s,
-        mode_tensor,
-        mask,
         attention_output: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states, attention_output[0])
         query, key, value = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -227,10 +205,14 @@ class LlamaAttention(nn.Module):
         key = key.view(-1, self.num_kv_heads, self.head_dim)
         value = value.view(-1, self.num_kv_heads, self.head_dim)
 
-        block_size = int(kv_cache[1].shape[1])
-        torch.ops.my_ops.hybrid_attention(attention_output[1], mode_tensor, query, key, value, kv_cache[0], kv_cache[1],
-                                        cos, sin, input_lengths, cache_lengths, prompt_lengths, slots, block_tables, mask,
-                                        block_tables.size(1), max_s, block_size, self.scaling)
+        attn_metadata = get_forward_context().attn_metadata
+        if attn_metadata is not None:
+            attn_metadata = attn_metadata[self.attn_metadata_prefix]
+            assert isinstance(attn_metadata, SophTPUMetadata)
+            attn_metadata.cos = cos
+            attn_metadata.sin = sin
+            attn_metadata.buffer = attention_output[1]
+            attn_out = self.attn(query, key, value)
 
         # Reshape the output tensor.
         output, _ = self.o_proj(attention_output[1].view(-1, self.num_heads * self.head_dim), attention_output[2])
@@ -290,78 +272,31 @@ class LlamaDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                eps=config.rms_norm_eps)
-        self.eps = config.rms_norm_eps
-        self.input_layernorm_weight = self.input_layernorm.weight.data
-        self.post_attention_layernorm_weight = self.post_attention_layernorm.weight.data
+        self.input_layernorm = SophonRMSNorm(config.hidden_size,
+                                             eps=config.rms_norm_eps)
+        self.post_attention_layernorm = SophonRMSNorm(config.hidden_size,
+                                                      eps=config.rms_norm_eps)
     def forward(
         self,
         hidden_states: torch.Tensor,
-        kv_cache: torch.Tensor,
-        block_tables,
-        slots,
-        input_lengths,
-        cache_lengths,
-        prompt_lengths,
-        max_s,
-        mode_tensor,
-        mask,
         residual: Optional[torch.Tensor],
-        cos: torch.Tensor,
-        sin: torch.Tensor,
         attn_buffer: torch.Tensor,
         mlp_buffer: torch.Tensor,
         rms_buffer: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor, 
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
 
-        """
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            kv_cache=kv_cache,
-            attn_metadata=attn_metadata,
-        )
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states, residual = self.input_layernorm(hidden_states, rms_buffer, residual)
 
-        return hidden_states, residual
+        attn_output = self.self_attn(hidden_states, attn_buffer, cos, sin)
 
-        """
-        res = soph_rmsnorm(self.input_layernorm_weight, rms_buffer, hidden_states, self.eps, residual)
+        hidden_states, residual = self.post_attention_layernorm(attn_output, rms_buffer, residual)
 
-        attn_output = self.self_attn(
-            rms_buffer,
-            cos,
-            sin,
-            kv_cache,
-            block_tables,
-            slots,
-            input_lengths,
-            cache_lengths,
-            prompt_lengths,
-            max_s,
-            mode_tensor,
-            mask,
-            attn_buffer
-        )
+        self.mlp(hidden_states, mlp_buffer)
 
-        attn_res = soph_rmsnorm(self.post_attention_layernorm_weight, rms_buffer, attn_output, self.eps, res)
-
-        self.mlp(rms_buffer, mlp_buffer)
-
-        return mlp_buffer, attn_res
+        return mlp_buffer, residual
 
 @support_torch_compile
 class LlamaModel(nn.Module):
@@ -403,16 +338,12 @@ class LlamaModel(nn.Module):
                                       prefix=prefix),
             prefix=f"{prefix}.layers",
         )
-        if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        else:
-            self.norm = PPMissingLayer()
 
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = SophonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 
@@ -434,7 +365,6 @@ class LlamaModel(nn.Module):
         self.attn_buffer = None
         self.rms_buffer = None
 
-        self.eps = config.rms_norm_eps
         self.tp_size = get_tensor_model_parallel_world_size()
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -444,8 +374,6 @@ class LlamaModel(nn.Module):
         self,
         input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
@@ -466,7 +394,7 @@ class LlamaModel(nn.Module):
 
         if self.mlp_buffer is None or hidden_states.shape[0] != self.mlp_buffer.shape[0]:
             self.mlp_buffer = torch.empty_like(hidden_states)
-        # {MM-QKV output, Attention output, Attention_FC output}
+            # {MM-QKV output, Attention output, Attention_FC output}
             self.attn_buffer = []
             self.attn_buffer.append(hidden_states.new_empty(hidden_states.shape[0], (self.num_heads + 2 * self.num_kv_heads) * self.head_dim // self.tp_size))
             self.attn_buffer.append(hidden_states.new_empty((hidden_states.shape[0], self.num_heads // self.tp_size, self.head_dim)))
@@ -476,34 +404,16 @@ class LlamaModel(nn.Module):
         rms_buffer = self.rms_buffer
         attn_buffer = self.attn_buffer
 
-        block_tables = attn_metadata.block_tables
-        slots = attn_metadata.slot_mapping
-        input_lengths = attn_metadata.input_lengths
-        cache_lengths = attn_metadata.cache_lengths
-        prompt_lengths = input_lengths + cache_lengths
-        max_s = prompt_lengths.max().item()
-        mode_tensor = torch.where(input_lengths > 1)[0]
-        mask = None
-
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 hidden_states,
-                kv_caches[i - self.start_layer],
-                block_tables,
-                slots,
-                input_lengths,
-                cache_lengths,
-                prompt_lengths,
-                max_s,
-                mode_tensor,
-                mask,
                 residual,
-                cos,
-                sin,
                 attn_buffer,
                 mlp_buffer,
                 rms_buffer,
+                cos,
+                sin,
             )
 
         if not get_pp_group().is_last_rank:
@@ -511,10 +421,8 @@ class LlamaModel(nn.Module):
                 "hidden_states": hidden_states,
                 "residual": residual
             })
-        #hidden_states, _ = self.norm(hidden_states, residual)
-        soph_rmsnorm(self.norm.weight, rms_buffer, hidden_states, self.eps, residual)
-        #return hidden_states
-        return rms_buffer
+        hidden_states, _ = self.norm(hidden_states, rms_buffer, residual)
+        return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
@@ -667,13 +575,11 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                     self.model.embed_tokens)
 
             logit_scale = getattr(config, "logit_scale", 1.0)
-            self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
-                                                    config.vocab_size,
-                                                    logit_scale)
+            self.logits_processor = LogitsProcessor(config.vocab_size)
         else:
             self.lm_head = PPMissingLayer()
 
-        self.sampler = get_sampler()
+        self.sampler = Sampler()
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
@@ -688,27 +594,27 @@ class LlamaForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        model_output = self.model(input_ids, positions, kv_caches,
-                                  attn_metadata, intermediate_tensors,
+        model_output = self.model(input_ids,
+                                  positions,
+                                  intermediate_tensors,
                                   inputs_embeds)
         return model_output
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
-    def sample(self, logits: torch.Tensor,
-               sampling_metadata: SamplingMetadata) -> Optional[SamplerOutput]:
+    def sample(
+        self,
+        logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[SamplerOutput]:
         next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 

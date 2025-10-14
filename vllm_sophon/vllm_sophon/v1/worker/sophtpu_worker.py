@@ -13,22 +13,21 @@ from vllm.distributed import (init_distributed_environment, ensure_model_paralle
 from vllm.logger import init_logger
 from vllm.model_executor import set_random_seed
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE
-from vllm.v1.core.scheduler import SchedulerOutput
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.v1.utils import bind_kv_cache
+from vllm.v1.worker.utils import bind_kv_cache
 from vllm.distributed.parallel_state import _WORLD, init_world_group
 from vllm_sophon.platform import get_soph_config_manager
-from vllm_sophon.v1.worker.sophtpu_model_runner import ExecutionMode, SophTPUModelRunner, SophAttentionSpec, SophTPUAttentionBackend
+from vllm_sophon.v1.worker.sophtpu_model_runner import SophTPUModelRunner
+from vllm_sophon.attention.attention import SophTPUAttentionBackend
+from vllm.v1.worker.worker_base import WorkerBase
 import math
-
-
 
 logger = init_logger(__name__)
 
-
-class SophTPUWorker:
+class SophTPUWorker(WorkerBase):
 
     def __init__(
         self,
@@ -38,6 +37,12 @@ class SophTPUWorker:
         distributed_init_method: str,
         is_driver_worker: bool = False,
     ):
+
+        super().__init__(vllm_config=vllm_config,
+                         local_rank=local_rank,
+                         rank=rank,
+                         distributed_init_method=distributed_init_method,
+                         is_driver_worker=is_driver_worker)
 
         from vllm_sophon import ops
         from vllm_sophon import hack
@@ -51,7 +56,7 @@ class SophTPUWorker:
         self.scheduler_config = vllm_config.scheduler_config
         self.device_config = vllm_config.device_config
         self.speculative_config = vllm_config.speculative_config
-        self.prompt_adapter_config = vllm_config.prompt_adapter_config
+        # self.prompt_adapter_config = vllm_config.prompt_adapter_config
         self.observability_config = vllm_config.observability_config
 
         self.parallel_config.rank = rank
@@ -127,68 +132,17 @@ class SophTPUWorker:
             You may limit the usage of GPU memory
             by adjusting the `gpu_memory_utilization` parameter.
         """
-        kv_caches: Dict[str, torch.Tensor] = {}
-        kv_cache_spec = self.model_runner.get_kv_cache_spec()
-        for layer_name, layer_spec in kv_cache_spec.items():
-            if isinstance(layer_spec, SophAttentionSpec):
-                dtype = layer_spec.dtype
-                min_num_block = (
-                    self.scheduler_config.max_num_batched_tokens
-                    + self.cache_config.block_size
-                ) // self.cache_config.block_size
-                # dummy kv cache for profiling
-                kv_cache_shape = SophTPUAttentionBackend.get_kv_cache_shape(
-                    min_num_block, self.cache_config.block_size, 1, 1)
-                dtype = layer_spec.dtype
-
-                if self.model_config.is_deepseek_mla:
-                    assert self.model_config.use_mla
-                    qk_rope_head_dim = getattr(self.model_config.hf_text_config, "qk_rope_head_dim", 0)
-                    kv_lora_rank = self.model_config.hf_text_config.kv_lora_rank
-                    tpu_kv_cache = torch.empty((kv_cache_shape[0], kv_cache_shape[1], kv_lora_rank),
-                                               dtype=dtype,
-                                               device=self.device)
-                    tpu_pe_cache = torch.empty((kv_cache_shape[0], kv_cache_shape[1], qk_rope_head_dim),
-                                               dtype=dtype,
-                                               device=self.device)
-
-                    kv_caches[layer_name] = (tpu_kv_cache, tpu_pe_cache)
-                else:
-                    tpu_k_cache = torch.empty(kv_cache_shape,
-                                              dtype=dtype,
-                                              device=self.device)
-                    tpu_v_cache = torch.empty_like(tpu_k_cache)
-
-                    kv_caches[layer_name] = (tpu_k_cache, tpu_v_cache)
-            else:
-                raise NotImplementedError
 
         torch.tpu.empty_cache()
         torch.tpu.synchronize()
         torch.tpu.reset_peak_memory_stats()
         _, total_gpu_memory = torch.tpu.mem_get_info()
 
-        # Execute a forward pass with dummy inputs to profile the memory usage
-        # of the model.
-        runner_kv_caches: List[torch.Tensor] = []
-        bind_kv_cache(
-            kv_caches,
-            self.vllm_config.compilation_config.static_forward_context,
-            runner_kv_caches)
-        
         logger.info(f'---- START DUMMY RUN ----')
 
-        self.model_runner.dummy_run(
-            runner_kv_caches,
-            num_tokens=1,
-            seq_len=self.scheduler_config.max_num_batched_tokens,
-            exec_mode=ExecutionMode.PREFILL,
-        )
-        self.model_runner.dummy_run(
-            runner_kv_caches,
-            num_tokens=self.scheduler_config.max_num_seqs,
-            seq_len=1,
-            exec_mode=ExecutionMode.DECODE,
+        self.model_runner._dummy_run(
+            num_tokens=self.scheduler_config.max_num_batched_tokens,
+            with_prefill=True,
         )
 
         # Get the peak memory allocation recorded by torch
@@ -238,14 +192,29 @@ class SophTPUWorker:
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return self.model_runner.get_kv_cache_spec()
 
-    def initialize_cache(self, kv_cache_configs: List[KVCacheConfig]) -> None:
+    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
-        kv_cache_config = kv_cache_configs[self.rank]
+
         self.model_runner.initialize_kv_cache(kv_cache_config)
+
+    #def initialize_cache(self, kv_cache_configs: List[KVCacheConfig]) -> None:
+    #    """Allocate GPU KV cache with the specified kv_cache_config."""
+    #    kv_cache_config = kv_cache_configs[self.rank]
+    #    self.model_runner.initialize_kv_cache(kv_cache_config)
+
+    def initialize_cache(self, num_gpu_blocks: int,
+                         num_cpu_blocks: int) -> None:
+        self.cache_config.num_gpu_blocks = num_gpu_blocks
+        self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
         return
+
+    def shutdown(self) -> None:
+        if runner := getattr(self, "model_runner", None):
+            runner.ensure_kv_transfer_shutdown()
+
 
 def init_sophon_worker_distributed_environment(
     parallel_config: ParallelConfig,

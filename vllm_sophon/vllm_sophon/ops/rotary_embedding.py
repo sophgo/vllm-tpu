@@ -3,8 +3,8 @@ from typing import Optional, Tuple
 import torch
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding, RotaryEmbedding, MRotaryEmbedding)
-from vllm.model_executor.layers.rotary_embedding import (
-    _yarn_find_correction_range, _yarn_linear_ramp_mask)
+from vllm.model_executor.layers.rotary_embedding.common import (
+    yarn_find_correction_range, yarn_linear_ramp_mask)
 
 def rope_forward_oot(
     self,
@@ -29,11 +29,11 @@ def rope_deepseek_compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
     inv_freq_extrapolation = 1.0 / pos_freqs
     inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
-    low, high = _yarn_find_correction_range(self.beta_fast, self.beta_slow,
+    low, high = yarn_find_correction_range(self.beta_fast, self.beta_slow,
                                             self.rotary_dim, self.base,
                                             self.max_position_embeddings)
     # Get n-d rotational scaling corrected for extrapolation
-    inv_freq_mask = (1 - _yarn_linear_ramp_mask(
+    inv_freq_mask = (1 - yarn_linear_ramp_mask(
         low, high, self.rotary_dim // 2,
         dtype=torch.float)) * self.extrapolation_factor
     inv_freq = inv_freq_interpolation * (

@@ -47,14 +47,15 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.tpu.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
-
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.utils import (PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
@@ -66,6 +67,7 @@ from vllm_sophon.ops.soph_linear import (SophColumnParallelLinear,
                                                     SophRowParallelLinear,
                                                     soph_to_dtype)
 from vllm_sophon.ops.soph_embedding import SophEmbedding
+from vllm_sophon.ops.layernorm import SophonRMSNorm
 
 # def print_tensor_info(name, param):
 #     print(f"  - {name}:", end=" ")
@@ -94,20 +96,6 @@ from vllm_sophon.ops.soph_embedding import SophEmbedding
 #         end_time = time.time_ns()
 #         latency = (end_time - self.start_time) // 1e3
 #         logger.info(f'Time {self.name} {latency}us')
-
-def soph_rmsnorm(weight, output, hidden_states, variance_epsilon, residual=None):
-    if residual is not None:
-        hidden_states += residual
-    residual = hidden_states
-    torch.ops.my_ops.rmsnorm_forward(
-        hidden_states,
-        weight,
-        None,
-        output,
-        hidden_states.dim() - 1,
-        variance_epsilon,
-    )
-    return residual
 
 # Copied from transformers.models.llama.modeling_llama.rotate_half
 def rotate_half(x):
@@ -236,10 +224,11 @@ class DeepseekV3Config(PretrainedConfig):
 class DeepseekV3Attention(torch.nn.Module):
     def __init__(
         self,
-        prefix: str,
-        config,
+        vllm_config: VllmConfig,
+        config: Union[DeepseekV2Config, DeepseekV3Config],
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = None,
         attn_type: str = AttentionType.DECODER
     ):
         super().__init__()
@@ -287,8 +276,8 @@ class DeepseekV3Attention(torch.nn.Module):
                                              quant_config=quant_config,
                                              prefix=f"{prefix}.q_a_proj")
 
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank,
-                                         eps=config.rms_norm_eps)
+            self.q_a_layernorm = SophonRMSNorm(self.q_lora_rank,
+                                               eps=config.rms_norm_eps)
 
             # load q-b fp8 weights and f16 scales, with parallel
             self.q_b_proj = SophColumnParallelLinear(self.q_lora_rank,
@@ -298,8 +287,8 @@ class DeepseekV3Attention(torch.nn.Module):
                                                  quant_config=quant_config,
                                                  prefix=f"{prefix}.q_b_proj")
 
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank,
-                                      eps=config.rms_norm_eps)
+        self.kv_a_layernorm = SophonRMSNorm(self.kv_lora_rank,
+                                            eps=config.rms_norm_eps)
 
         # load kv-a fp8 weights and f16 scales, no parallel
         self.kv_a_proj_with_mqa = SophReplicatedLinear(
@@ -323,17 +312,6 @@ class DeepseekV3Attention(torch.nn.Module):
                                         prefix=f"{prefix}.o_proj")
 
         self.num_groups = self.num_heads // self.num_key_value_heads
-        # self.quantized = quant_config
-
-        # register kv-cache buffer and pe-cache buffer, {batch, seqlen, kv_lora_rank}
-        import os
-        soph_config_manager = get_soph_config_manager()
-        self.max_cache_size = soph_config_manager.get('CONTEXT_LEN') + soph_config_manager.get('DECODE_TOKEN_LEN') + int(os.getenv("chat_token_num", "0"))
-        self.kv_cache = None
-        self.pe_cache = None
-        self.use_paged_kv_cache = True
-
-        self.eps=config.rms_norm_eps
 
         self.attn = Attention(self.num_heads,
                               self.kv_lora_rank + self.qk_rope_head_dim,
@@ -343,21 +321,14 @@ class DeepseekV3Attention(torch.nn.Module):
                               quant_config=quant_config,
                               prefix=f"{prefix}.attn",
                               attn_type=attn_type)
+        self.attn_metadata_prefix = f"{prefix}.attn"
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        cu_seqlen_prefill: torch.Tensor,
-        kv_cache,
-        block_tables: torch.Tensor,
-        slots: torch.Tensor,
-        input_lengths,
-        cache_lengths,
         kvu,
-        max_s: int,
-        mask,
         attention_output,
     ):
         self.kv_b_weight = (self.kv_b_proj.weight.data, self.kv_b_proj.weight_scale_inv.data)
@@ -366,22 +337,16 @@ class DeepseekV3Attention(torch.nn.Module):
         self.kv_a_weight_with_mqa = (self.kv_a_proj_with_mqa.weight.data, self.kv_a_proj_with_mqa.weight_scale_inv.data)
         self.o_proj_weight = (self.o_proj.weight.data, self.o_proj.weight_scale_inv.data)
 
-        batch = input_lengths.shape[0]
-        if self.kv_cache is None and self.use_paged_kv_cache == False:
-            self.kv_cache = torch.empty(batch, self.max_cache_size, self.kv_lora_rank,
-                                        device=hidden_states.device, dtype=hidden_states.dtype)
-            self.pe_cache = torch.empty(batch, self.max_cache_size, self.qk_rope_head_dim,
-                                        device=hidden_states.device, dtype=hidden_states.dtype)
         seqlen = hidden_states.shape[0]
         lquery = attention_output["lquery"]
         normed_lquery = attention_output["normed_lquery"]
         lkv = attention_output["lkv"]
         normed_lkv_nope = attention_output["normed_lkv_nope"]
- 
+
         lkv_nope = attention_output["lkv_nope"]
         normed_lkv_nope = attention_output["normed_lkv_nope"]
         key_pe = attention_output["key_pe"]
- 
+
         if self.q_lora_rank is None:
             query = self.q_proj(hidden_states)
         else:
@@ -390,7 +355,7 @@ class DeepseekV3Attention(torch.nn.Module):
                 *self.q_a_proj_weight,
                 lquery,
                 self.weight_block_size)
-            soph_rmsnorm(self.q_a_layernorm.weight.data, normed_lquery, lquery, self.eps)
+            lquery, _ = self.q_a_layernorm(lquery, normed_lquery)
             query = normed_lquery
 
         # kv-compress and k-pe
@@ -406,37 +371,24 @@ class DeepseekV3Attention(torch.nn.Module):
             lkv_nope = lkv[0, :self.kv_lora_rank]
             key_pe = lkv[0, self.kv_lora_rank:]
 
-        soph_rmsnorm(self.kv_a_layernorm.weight.data, normed_lkv_nope, lkv_nope, self.eps)
+        lkv_nope, _ = self.kv_a_layernorm(lkv_nope, normed_lkv_nope)
 
-        if self.use_paged_kv_cache == False:
-            torch.ops.my_ops.latent_attention_fp8(
-                attention_output["attn_out"],
-                query,
-                normed_lkv_nope,
-                key_pe,
-                self.q_b_weight[0],
-                self.kv_b_weight[0],
-                self.kv_cache,
-                self.pe_cache,
-                cos,
-                sin,
-                self.q_b_weight[1],
-                self.kv_b_weight[1],
-                kvu,
-                mask,
-                input_lengths,
-                self.num_heads,
-                self.q_lora_rank,
-                self.kv_lora_rank,
-                self.qk_nope_head_dim,
-                self.qk_rope_head_dim,
-                self.value_head_size,
-                max_s,
-                self.weight_block_size,
-                self.kv_cache.shape[1],
-                self.softmax_scale,
-                0 if cu_seqlen_prefill is not None else 1)
-        else:
+        forward_context = get_forward_context()
+        attn_metadata = get_forward_context().attn_metadata
+        if attn_metadata is not None:
+            attn_metadata = attn_metadata[self.attn_metadata_prefix]
+            assert isinstance(attn_metadata, SophTPUMetadata)
+            attn_state = attn_metadata.attn_state
+            cu_seqlen_prefill = attn_state not in [
+                SophAttentionState.DecodeOnly, SophAttentionState.SpecDecoding
+            ]
+            block_tables = attn_metadata.block_tables
+            slots = attn_metadata.slot_mapping
+            input_lengths = attn_metadata.input_lengths
+            cache_lengths = attn_metadata.cache_lengths
+            input_lengths = input_lengths + cache_lengths
+            max_s = input_lengths.max().item()
+            kv_cache = self.kv_cache[forward_context.virtual_engine]
             torch.ops.my_ops.paged_latent_attention_fp8(
                 attention_output["attn_out"],
                 query,
@@ -453,7 +405,7 @@ class DeepseekV3Attention(torch.nn.Module):
                 block_tables,
                 slots if cu_seqlen_prefill is None else block_tables,
                 kvu,
-                mask,
+                None,
                 input_lengths,
                 cache_lengths,
                 self.num_heads,
@@ -663,13 +615,17 @@ class DeepseekV3MoE(nn.Module):
 class DeepseekV3DecoderLayer(nn.Module):
     def __init__(
         self,
-        config: PretrainedConfig,
+        vllm_config: VllmConfig,
         prefix: str,
-        model_config: ModelConfig,
-        cache_config: Optional[CacheConfig] = None,
-        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
+
+        config = vllm_config.model_config.hf_config
+        model_config = vllm_config.model_config
+        cache_config = vllm_config.cache_config
+        quant_config = vllm_config.quant_config
+        parallel_config = vllm_config.parallel_config
+
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -679,10 +635,11 @@ class DeepseekV3DecoderLayer(nn.Module):
         # with the layer's index.
         layer_idx = int(prefix.split(sep='.')[-1])
         self.self_attn = DeepseekV3Attention(
-            prefix=f"{prefix}.self_attn",
+            vllm_config=vllm_config,
             config=config,
             cache_config=cache_config,
             quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
 
         if (config.n_routed_experts is not None
@@ -701,12 +658,11 @@ class DeepseekV3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                eps=config.rms_norm_eps)
-        
-        self.eps = config.rms_norm_eps
+        self.input_layernorm = SophonRMSNorm(config.hidden_size,
+                                             eps=config.rms_norm_eps)
+        self.post_attention_layernorm = SophonRMSNorm(config.hidden_size,
+                                                      eps=config.rms_norm_eps)
+
         self.tp_size = get_tensor_model_parallel_world_size()
 
     def forward(
@@ -715,15 +671,7 @@ class DeepseekV3DecoderLayer(nn.Module):
         residual: torch.Tensor,
         cos: torch.Tensor,
         sin: torch.Tensor,
-        cu_seqlen_prefill: torch.Tensor,
-        kv_cache,
-        block_tables: torch.Tensor,
-        slots: torch.Tensor,
-        input_lengths,
-        cache_lengths,
         kvu,
-        max_s: int,
-        mask,
         attn_buffer,
         rms_buffer,
         mlp_buffer,
@@ -732,23 +680,15 @@ class DeepseekV3DecoderLayer(nn.Module):
         default_device,
         default_dtype
     ):
-        res = soph_rmsnorm(self.input_layernorm.weight, rms_buffer, hidden_states, self.eps, residual)
+        hidden_states, residual = self.input_layernorm(hidden_states, rms_buffer, residual)
         attn_output = self.self_attn(
             rms_buffer,
             cos,
             sin,
-            cu_seqlen_prefill,
-            kv_cache,
-            block_tables,
-            slots,
-            input_lengths,
-            cache_lengths,
             kvu,
-            max_s,
-            mask,
             attn_buffer
         )
-        attn_res = soph_rmsnorm(self.post_attention_layernorm.weight, rms_buffer, attn_output, self.eps, res)
+        attn_output, residual = self.post_attention_layernorm(attn_output, rms_buffer, residual)
         mlp_output = self.mlp(
             rms_buffer, mlp_buffer,
             gathered_experts_out_buf,
@@ -794,16 +734,13 @@ class DeepseekV3Model(torch.nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV3DecoderLayer(
-                config,
+                vllm_config,
                 prefix,
-                model_config=model_config,
-                cache_config=cache_config,
-                quant_config=quant_config,
             ),
             prefix=f"{prefix}.layers")
 
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = SophonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
         self.make_empty_intermediate_tensors = (
@@ -837,8 +774,6 @@ class DeepseekV3Model(torch.nn.Module):
         self.attn_buffer = None
         self.rms_buffer = None
 
-        self.eps = config.rms_norm_eps
-
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -846,8 +781,6 @@ class DeepseekV3Model(torch.nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
@@ -895,17 +828,16 @@ class DeepseekV3Model(torch.nn.Module):
         sin = sin.contiguous().unsqueeze(1).repeat(1, 1, 2)
 
         # Attention metadata
-        cu_seqlen_prefill = attn_metadata.num_prefills
-        block_tables = attn_metadata.block_tables
-        slots = attn_metadata.slot_mapping
-        input_lengths = attn_metadata.input_lengths
-        cache_lengths = attn_metadata.cache_lengths
-        input_lengths = input_lengths + cache_lengths
-        max_s = input_lengths.max().item()
-        mask = None 
+        attn_metadata = get_forward_context().attn_metadata
+        # assume all layers have the same attn_state, use the first layer attn_metadata
+        attn_metadata = attn_metadata[self.start_layer.attn_metadata_prefix]
+        attn_state = attn_metadata.attn_state
+        cu_seqlen_prefill = attn_state not in [
+            SophAttentionState.DecodeOnly, SophAttentionState.SpecDecoding
+        ]
 
         kvu = None
-        if cu_seqlen_prefill is not None:
+        if cu_seqlen_prefill:
             kvu = torch.empty((max_s, self.num_heads, self.qk_nope_head_dim + self.value_head_size), dtype = default_dtype, device = default_device)
 
         for i in range(self.start_layer, self.end_layer):
@@ -915,15 +847,7 @@ class DeepseekV3Model(torch.nn.Module):
                 residual,
                 cos,
                 sin,
-                cu_seqlen_prefill,
-                kv_caches[i - self.start_layer],
-                block_tables,
-                slots,
-                input_lengths,
-                cache_lengths,
                 kvu,
-                max_s,
-                mask,
                 attn_buffer,
                 rms_buffer,
                 mlp_buffer,
@@ -938,7 +862,7 @@ class DeepseekV3Model(torch.nn.Module):
                 "hidden_states": hidden_states,
                 "residual": residual
             })
-        soph_rmsnorm(self.norm.weight, rms_buffer, hidden_states, self.eps, residual)
+        hidden_states, residual = self.norm(hidden_states, rms_buffer, residual)
         return rms_buffer
 
 
@@ -955,7 +879,7 @@ class DeepseekV3ForCausalLM(nn.Module, SupportsPP):
                                       config.hidden_size,
                                       quant_config=quant_config)
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.sampler = get_sampler()
+        self.sampler = Sampler()
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
 
@@ -966,13 +890,12 @@ class DeepseekV3ForCausalLM(nn.Module, SupportsPP):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata, intermediate_tensors,
+        hidden_states = self.model(input_ids,
+                                   positions,
+                                   intermediate_tensors,
                                    inputs_embeds)
         return hidden_states
 

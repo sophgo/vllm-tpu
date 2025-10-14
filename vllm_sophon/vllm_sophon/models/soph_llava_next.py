@@ -12,8 +12,9 @@ from typing_extensions import NotRequired
 
 from vllm.attention import AttentionMetadata
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
-from vllm.model_executor.sampling_metadata import SamplingMetadata
+from vllm.v1.outputs import SamplerOutput
+from vllm.v1.sample.sampler import Sampler
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig, NestedTensors
 from vllm.multimodal.parse import ImageSize
@@ -482,7 +483,7 @@ class LlavaNextForConditionalGeneration(nn.Module, SupportsMultiModal,
         if hasattr(self.language_model, "sampler"):
             return self.language_model.sampler
 
-        return get_sampler()
+        return Sampler()
 
     def _validate_image_sizes(self, data: torch.Tensor) -> torch.Tensor:
         expected_dims = (2, )
@@ -804,8 +805,6 @@ class LlavaNextForConditionalGeneration(nn.Module, SupportsMultiModal,
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[torch.Tensor],
-        attn_metadata: AttentionMetadata,
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         **kwargs: object,
@@ -868,22 +867,20 @@ class LlavaNextForConditionalGeneration(nn.Module, SupportsMultiModal,
         elif inputs_embeds is not None:
             input_ids = None
 
-        hidden_states = self.language_model.model(input_ids,
-                                                  positions,
-                                                  kv_caches,
-                                                  attn_metadata,
-                                                  intermediate_tensors,
-                                                  inputs_embeds=inputs_embeds)
+        hidden_states = self.language_model.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
 
         return hidden_states
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        return self.language_model.compute_logits(hidden_states,
-                                                  sampling_metadata)
+        return self.language_model.compute_logits(hidden_states)
 
     def sample(
         self,

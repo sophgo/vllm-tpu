@@ -8,24 +8,35 @@ from typing import (Any, Callable, Dict, Generator, Iterable, List, Optional,
                     Tuple, cast)
 
 import vllm
-from vllm.config import (ModelConfig, LoadFormat)
+from vllm.config import ModelConfig, VllmConfig
 from vllm.attention import Attention
 from vllm.transformers_utils.config import get_config
+from vllm.model_executor.layers.linear import QKVCrossParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
-from vllm.model_executor.model_loader.loader import device_loading_context
-from vllm.model_executor.model_loader.loader import _process_weights_after_loading
+from vllm.model_executor.model_loader.utils import (device_loading_context,
+                                                    initialize_model,
+                                                    set_default_torch_dtype)
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf, download_weights_from_hf,
-    filter_duplicate_safetensors_files, filter_files_not_needed_for_inference)
+    filter_duplicate_safetensors_files, filter_files_not_needed_for_inference,
+    maybe_download_from_modelscope)
 
 from vllm_sophon.hack.soph_utils import weight_reorder
 from vllm_sophon.ops.soph_linear import SophRowParallelLinear, SophColumnParallelLinear, SophReplicatedLinear
 from vllm_sophon.ops.soph_fused_moe import SophDeepseekV3FusedMoE
 
-# hack for _process_weights_after_loading
-def _process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
+from vllm.logger import init_logger
+logger = init_logger(__name__)
+
+# hack for process_weights_after_loading
+def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
                                    target_device: torch.device) -> None:
     for _, module in model.named_modules():
+        if isinstance(module, QKVCrossParallelLinear):
+            # NOTE(Isotr0py): special case for cross QKV layer because
+            # q and kv proj aren't registered as submodules intentionally
+            module.process_weights_after_loading()
+            continue
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
             # When quant methods need to process weights after loading
@@ -64,7 +75,7 @@ def _prepare_weights(
     """Prepare weights for the model.
 
     If the model is not local, it will be downloaded."""
-    model_name_or_path = (self._maybe_download_from_modelscope(
+    model_name_or_path = (maybe_download_from_modelscope(
         model_name_or_path, revision) or model_name_or_path)
 
     is_local = os.path.isdir(model_name_or_path)
@@ -72,18 +83,19 @@ def _prepare_weights(
     use_safetensors = False
     index_file = SAFE_WEIGHTS_INDEX_NAME
     # Some quantized models use .pt files for storing the weights.
-    if load_format == LoadFormat.AUTO:
+    if load_format == "auto":
         allow_patterns = ["*.safetensors", "*.bin"]
-    elif load_format == LoadFormat.SAFETENSORS:
+    elif (load_format == "safetensors"
+            or load_format == "fastsafetensors"):
         use_safetensors = True
         allow_patterns = ["*.safetensors"]
-    elif load_format == LoadFormat.MISTRAL:
+    elif load_format == "mistral":
         use_safetensors = True
         allow_patterns = ["consolidated*.safetensors"]
         index_file = "consolidated.safetensors.index.json"
-    elif load_format == LoadFormat.PT:
+    elif load_format == "pt":
         allow_patterns = ["*.pt"]
-    elif load_format == LoadFormat.NPCACHE:
+    elif load_format == "npcache":
         allow_patterns = ["*.bin"]
     else:
         raise ValueError(f"Unknown load_format: {load_format}")
@@ -146,5 +158,24 @@ def _prepare_weights(
     return hf_folder, hf_weights_files, use_safetensors
 
 
-vllm.model_executor.model_loader.loader._process_weights_after_loading = _process_weights_after_loading
-vllm.model_executor.model_loader.loader.DefaultModelLoader._prepare_weights = _prepare_weights
+def load_model(self, vllm_config: VllmConfig,
+               model_config: ModelConfig) -> nn.Module:
+    """Load a model with the given configurations."""
+    device_config = vllm_config.device_config
+    load_config = vllm_config.load_config
+    load_device = device_config.device if load_config.device is None else \
+                  load_config.device
+    target_device = torch.device(load_device)
+    with set_default_torch_dtype(model_config.dtype):
+        with target_device:
+            model = initialize_model(vllm_config=vllm_config,
+                                     model_config=model_config)
+
+        logger.debug("Loading weights on %s ...", load_device)
+        # Quantization does not happen in `load_weights` but after it
+        self.load_weights(model, model_config)
+        process_weights_after_loading(model, model_config, target_device)
+    return model.eval()
+
+vllm.model_executor.model_loader.base_loader.BaseModelLoader.load_model = load_model
+vllm.model_executor.model_loader.default_loader.DefaultModelLoader._prepare_weights = _prepare_weights
