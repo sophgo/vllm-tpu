@@ -25,9 +25,9 @@ echo PIP_INDEX_URL: ${PIP_INDEX_URL}
 IMAGE_NAME="soph_vllm"
 IMAGE_TAG="0.7.3"
 DOCKERFILE="Dockerfile.sophtpu"
+DOCKERFILE_SHA256=$(sha256sum ${DOCKERFILE} | cut -c 1-8)
 
 COMMIT_ID=$(git rev-parse --short HEAD)
-DATE=$(date +%Y%m%d)
 TORCH_TPU_COMMIT_ID=$(ls third-party/torch-tpu* | awk -F'[_.]' '{print $(NF-2)}')
 
 # clean docker image
@@ -37,7 +37,7 @@ fi
 
 # build & export docker image
 docker build --build-arg PIP_INDEX_URL=${PIP_INDEX_URL} -f ${DOCKERFILE} -t ${IMAGE_NAME}:${IMAGE_TAG} .
-docker save ${IMAGE_NAME}:${IMAGE_TAG} | bzip2 > docker-${IMAGE_NAME}-${IMAGE_TAG}-${DATE}-${COMMIT_ID}-${TORCH_TPU_COMMIT_ID}.tar.bz2
+docker save ${IMAGE_NAME}:${IMAGE_TAG} | bzip2 > docker-${IMAGE_NAME}-${IMAGE_TAG}-${DOCKERFILE_SHA256}-${COMMIT_ID}-${TORCH_TPU_COMMIT_ID}.tar.bz2
 
 # Build docs
 DOCKER_IMG_PANDOC=${IMAGE_NAME}:${IMAGE_TAG}
