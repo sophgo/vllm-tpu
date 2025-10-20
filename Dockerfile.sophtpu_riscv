@@ -54,13 +54,37 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# # 创建目标目录并下载密钥
+# RUN mkdir -p /etc/apt/keyrings && \
+#     wget -O /etc/apt/keyrings/llvm-snapshot.gpg https://apt.llvm.org/llvm-snapshot.gpg.key
+
+# # 添加软件源（使用 signed-by 指定密钥路径）
+# RUN echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/focal/ llvm-toolchain-focal main" >> /etc/apt/sources.list.d/llvm.list
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    gnupg \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN wget -q -O /tmp/llvm-snapshot.gpg.key https://apt.llvm.org/llvm-snapshot.gpg.key \
+    && gpg --dearmor < /tmp/llvm-snapshot.gpg.key > /usr/share/keyrings/llvm-snapshot-archive-keyring.gpg \
+    && rm /tmp/llvm-snapshot.gpg.key
+
 # 安装所有必要的系统依赖
 RUN apt-get update && apt-get install -y \
     libsentencepiece-dev \
     libprotobuf-dev \
     protobuf-compiler \
     libprotoc-dev \
+    libssl-dev \
+    llvm-14-dev \
+    llvm-14-tools \
+    llvm-14 \
+    clang \
     && rm -rf /var/lib/apt/lists/*
+
+ENV LLVM_CONFIG=/usr/lib/llvm-14/bin/llvm-config
+ENV PATH="/usr/lib/llvm-14/bin:$PATH"
 
 # install uv and Rust
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
@@ -76,7 +100,7 @@ RUN cd third-party \
 #  && tar -xzvf torch-tpu*.tar.gz \
  && uv pip install ./torch-*_riscv64.whl \
  && rm -rf *
-ENV LD_LIBRARY_PATH=/usr/src/.venv/lib/python3.11/site-packages/torch/lib
+ENV LD_LIBRARY_PATH=/workspace/.venv/lib/python3.12/site-packages/torch/lib
 
 
 # install Python dependencies
@@ -96,7 +120,7 @@ RUN git clone https://github.com/mesonbuild/meson-python.git /tmp/meson-python \
 
 # copy vllm code
 COPY vllm /workspace/vllm
-COPY tests/models/decoder_only/language/test_whole_model.py /workspace
+COPY tests/soph_test /workspace/tests/soph_test
 
 # clean up
 RUN rm -rf /root/.cache/* /tmp/*
