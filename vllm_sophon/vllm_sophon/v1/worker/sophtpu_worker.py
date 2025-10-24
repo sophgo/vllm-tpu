@@ -115,7 +115,6 @@ class SophTPUWorker:
         # Init ModelRunner here, so that we have access to self.device.
         self.model_runner = SophTPUModelRunner(self.vllm_config, self.device)
 
-
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
