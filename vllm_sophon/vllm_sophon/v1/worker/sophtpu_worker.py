@@ -116,7 +116,6 @@ class SophTPUWorker:
         self.model_runner = SophTPUModelRunner(self.vllm_config, self.device)
 
 
-    @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
         memory can be used for KV cache without OOMs.
@@ -185,6 +184,12 @@ class SophTPUWorker:
             num_tokens=1,
             seq_len=self.scheduler_config.max_num_batched_tokens,
             exec_mode=ExecutionMode.PREFILL,
+        )
+        self.model_runner.dummy_run(
+            runner_kv_caches,
+            num_tokens=self.scheduler_config.max_num_seqs,
+            seq_len=1,
+            exec_mode=ExecutionMode.DECODE,
         )
 
         # Get the peak memory allocation recorded by torch

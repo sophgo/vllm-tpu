@@ -1040,8 +1040,6 @@ class SophTPUModelRunner:
                     dtype=torch.int32,
                     device=self.device)
 
-                effective_query_lens = torch.ones_like(context_lens)
-
                 attn_metadata = SophTPUMetadata(
                     num_prefills=num_tokens,
                     num_prefill_tokens=num_tokens * seq_len,
@@ -1051,7 +1049,9 @@ class SophTPUModelRunner:
                     enable_kv_scales_calculation=True,
                     block_tables=block_tables,
                     context_lens=context_lens,
-                    effective_query_lens=effective_query_lens,
+                    input_lengths=torch.zeros((num_tokens, ),dtype=torch.int32),
+                    cache_lengths=torch.full((num_tokens, ), seq_len,
+                                             dtype=torch.int32)
                 )
         else:
             assert seq_len == 1
@@ -1062,15 +1062,12 @@ class SophTPUModelRunner:
                                          dtype=torch.int32,
                                          device=self.device)
             slot_mapping = torch.zeros((num_tokens * seq_len),
-                                       dtype=torch.int64,
+                                       dtype=torch.int32,
                                        device=self.device)
             block_tables = torch.zeros(
                 (num_tokens, self.max_num_blocks_per_req),
                 dtype=torch.int32,
                 device=self.device)
-            context_lens = torch.ones((num_tokens, ),
-                                      dtype=torch.int32,
-                                      device=self.device)
             attn_metadata = SophTPUMetadata(
                 num_prefills=0,
                 num_prefill_tokens=0,
@@ -1079,7 +1076,8 @@ class SophTPUModelRunner:
                 multi_modal_placeholder_index_maps=None,
                 enable_kv_scales_calculation=True,
                 block_tables=block_tables,
-                context_lens=context_lens,
+                input_lengths=torch.ones((num_tokens, ), dtype=torch.int32),
+                cache_lengths=torch.zeros((num_tokens, ),dtype=torch.int32)
             )
 
         if self.is_multimodal_model:
