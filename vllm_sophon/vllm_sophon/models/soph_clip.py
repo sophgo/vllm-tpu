@@ -11,16 +11,14 @@ from vllm.distributed import (divide,
                               get_tensor_model_parallel_world_size,
                               get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_reduce)
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                                               RowParallelLinear)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsQuant
 
 from vllm.model_executor.models.vision import VisionEncoderInfo, resolve_visual_encoder_outputs
 from vllm_sophon.ops.soph_linear import (SophQKVParallelLinear,
-                                         SophRowParallelLinear)
-
+                                         SophRowParallelLinear,
+                                         SophColumnParallelLinear)
 
 class CLIPEncoderInfo(VisionEncoderInfo[CLIPVisionConfig]):
 
@@ -178,14 +176,14 @@ class SophCLIPMLP(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.rank = get_tensor_model_parallel_rank()
 
-        self.fc1 = ColumnParallelLinear(
+        self.fc1 = SophColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size,
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.fc1"
         )
-        self.fc2 = RowParallelLinear(
+        self.fc2 = SophRowParallelLinear(
             config.intermediate_size,
             config.hidden_size,
             bias=True,
@@ -193,15 +191,13 @@ class SophCLIPMLP(nn.Module):
             prefix=f"{prefix}.fc2"
         )
 
-        self.register_buffer("w1", self.fc1.weight.data.transpose(0,1).contiguous())
-        self.register_buffer("w2", self.fc2.weight.data.transpose(0,1).contiguous())
-        self.register_buffer("b1", self.fc1.bias.data.contiguous())
-        self.register_buffer("b2", None)
-        if self.rank == 0:
-            self.register_buffer("b2", self.fc2.bias.data.contiguous())
-
     def forward(self, mlp_out, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states.contiguous()
+        self.w1 = self.fc1.weight.data
+        self.w2 = self.fc2.weight.data
+        self.b1 = self.fc1.bias.data
+        self.b2 = self.fc2.bias.data if self.rank == 0 else None
+
         torch.ops.my_ops.llava_mlp(hidden_states, self.w1, self.w2, self.b1, self.b2, mlp_out)
         
         if self.tp_size > 1:

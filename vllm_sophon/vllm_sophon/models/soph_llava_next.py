@@ -253,7 +253,6 @@ class LlavaNextMultiModalProcessor(
             image_embeds=MultiModalFieldConfig.batched("image"),
         )
 
-
 class SophLlavaNextMultiModalProjector(nn.Module):
 
     def __init__(self,
@@ -270,7 +269,7 @@ class SophLlavaNextMultiModalProjector(nn.Module):
         self.linear_1 = SophColumnParallelLinear(vision_hidden_size,
                                              text_hidden_size,
                                              bias=multimodal_projector_bias,
-                                            skip_bias_add = False,
+                                             skip_bias_add = False,
                                              quant_config=quant_config,
                                              prefix=f"{prefix}.linear_1")
 
@@ -281,19 +280,18 @@ class SophLlavaNextMultiModalProjector(nn.Module):
                                           quant_config=quant_config,
                                           prefix=f"{prefix}.linear_2")
 
-        self.register_buffer("w1", self.linear_1.weight.data.transpose(0,1).contiguous())
+        self.w1 = self.linear_1.weight.data
         self.register_buffer("w2", self.linear_2.weight.data.transpose(0,1).contiguous())
-        self.register_buffer("b1", self.linear_1.bias.data.contiguous())
-        self.register_buffer("b2", None)
-        if self.rank == 0:
-            self.register_buffer("b2", self.linear_2.bias.data.contiguous())
-
-        self.out_buffer = None
 
     def forward(self, out_buffer, image_features: torch.Tensor) -> torch.Tensor:
 
         image_features = image_features.contiguous()
         self.out_buffer = out_buffer
+        self.w1 = self.linear_1.weight.data
+        self.b1 = self.linear_1.bias.data
+        self.w2 = self.linear_2.weight.data.transpose(0,1).contiguous()
+        self.b2 = self.linear_2.bias.data if self.rank == 0 else None
+
         torch.ops.my_ops.llava_mlp(image_features,
                                    self.w1, self.w2,
                                    self.b1, self.b2,
