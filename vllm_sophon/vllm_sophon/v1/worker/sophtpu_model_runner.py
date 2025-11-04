@@ -988,7 +988,15 @@ class SophTPUModelRunner:
             )
 
     def load_model(self) -> None:
+        # In cache mode, a large amount of memory fragmentation may occur during load_model,
+        # leading to kvcache allocation failures.
+        # Cache mode is disabled during load_model process, and this only causes a negligible
+        # performance impact during model initialization.
+        torch.tpu.stop_cache()
         self.model = get_model(vllm_config=self.vllm_config)
+        torch.tpu.synchronize()
+        torch.tpu.empty_cache()
+        torch.tpu.start_cache()
 
     def dummy_run(
         self,

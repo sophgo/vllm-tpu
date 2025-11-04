@@ -212,6 +212,7 @@ class SophTPUWorker:
             total_gpu_memory * self.cache_config.gpu_memory_utilization -
             peak_memory)
 
+        logger.info(f'Available kvcache memory: {available_kv_cache_memory / 1024**3} GB')
         return int(available_kv_cache_memory)
 
     def execute_model(
