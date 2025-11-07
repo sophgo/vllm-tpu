@@ -35,13 +35,15 @@ RUN pip install torch==2.8.0 torchvision==0.23 --index-url https://download.pyto
     && pip install -r requirements-sophtpu.txt \
     && rm requirements-*.txt
 
+RUN git clone --branch v0.7.3 https://github.com/vllm-project/vllm.git \
+ && cd vllm \
+ && python3 use_existing_torch.py \
+ && pip install -r requirements-build.txt \
+ && VLLM_TARGET_DEVICE=empty pip install -e . --no-build-isolation
 
-COPY vllm /workspace/vllm
-COPY tests/soph_test /workspace/tests/soph_test
-#RUN --mount=type=cache,target=/root/.cache/pip \
-#    --mount=type=cache,target=/root/.cache/ccache \
-#    --mount=type=bind,source=.git,target=.git \
-#    VLLM_TARGET_DEVICE=empty python3 setup.py develop
+COPY vllm_sophon /workspace/vllm_sophon
+WORKDIR /workspace/vllm_sophon
+RUN pip install -e . --no-build-isolation
 
 COPY third-party third-party
 
