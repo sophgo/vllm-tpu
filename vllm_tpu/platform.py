@@ -30,9 +30,10 @@ from vllm.logger import init_logger
 from vllm.platforms.interface import Platform, PlatformEnum, _Backend
 
 if TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    from vllm.config import ModelConfig, VllmConfig
     from vllm.utils import FlexibleArgumentParser
 else:
+    ModelConfig = None
     VllmConfig = None
     FlexibleArgumentParser = None
 
@@ -79,10 +80,21 @@ class SophTpuPlatform(Platform):
 
     @classmethod
     def inference_mode(cls):
-        return torch.no_grad()
+        return torch.inference_mode()
+
+    @classmethod
+    def empty_cache(cls):
+        torch.tpu.empty_cache()
+
+    @classmethod
+    def synchronize(cls):
+        torch.tpu.synchronize()
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        if not envs.VLLM_USE_V1:
+            raise ValueError("vLLM TPU does not support V0 engine.")
+
         from vllm.config import CompilationLevel
 
         cache_config = vllm_config.cache_config
@@ -90,17 +102,46 @@ class SophTpuPlatform(Platform):
             cache_config.block_size = 16
 
         compilation_config = vllm_config.compilation_config
+        model_config = vllm_config.model_config
+        parallel_config = vllm_config.parallel_config
 
-        if compilation_config and compilation_config.level != CompilationLevel.NO_COMPILATION:
-            logger.warning(
-                "Compilation level %s is not supported on TPU now, forcing compilation level to NO_COMPILATION",
-                compilation_config.level)
+        if model_config is None:
+            logger.warning("Model config is missing. This may indicate "
+                           "that we are running a test case")
+            enforce_eager = False
+        else:
+            enforce_eager = getattr(model_config, "enforce_eager", False)
+
+        from vllm.config.compilation import CUDAGraphMode
+        if enforce_eager:
+            logger.info("Compilation disabled, using eager mode by default")
             compilation_config.level = CompilationLevel.NO_COMPILATION
+        else:
+            compilation_config.cudagraph_mode = CUDAGraphMode.FULL
+            #compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+
+        compilation_config.cudagraph_num_of_warmups = 1
+
+        if compilation_config.level not in [
+                CompilationLevel.NO_COMPILATION, CompilationLevel.PIECEWISE
+        ]:
+            logger.warning(
+                "TPU does not support %s compilation level. Setting CUDAGraphMode to NONE",
+                compilation_config.level)
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+        vllm_config._set_cudagraph_sizes()
+
+        compilation_config.level = CompilationLevel.NO_COMPILATION
+        if compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+            compilation_config.level = CompilationLevel.NO_COMPILATION
+        else:
+            assert compilation_config.level == CompilationLevel.NO_COMPILATION
+            compilation_config.use_inductor = False
 
         assert vllm_config.speculative_config is None, \
             "Sophon TPU does not support speculative decoding"
 
-        parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
         if parallel_config.worker_cls == "auto":
             if envs.VLLM_USE_V1:
@@ -128,6 +169,24 @@ class SophTpuPlatform(Platform):
     @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "vllm_sophon.communicator.SophTpuCommunicator"  # noqa
+
+    @classmethod
+    def get_static_graph_wrapper_cls(cls) -> str:
+        """
+        Get piecewise backend class for piecewise graph.
+        """
+        return "vllm_sophon.compilation.tpu_graph.TPUGraphWrapper"  # noqa
+
+    @classmethod
+    def supports_v1(cls, model_config: ModelConfig) -> bool:
+        """Returns whether the current platform can support v1 for the supplied
+        model configuration.
+        """
+        return True
+
+    @classmethod
+    def support_static_graph_mode(cls) -> bool:
+        return True
 
     @classmethod
     def seed_everything(cls, seed: Optional[int] = None) -> None:

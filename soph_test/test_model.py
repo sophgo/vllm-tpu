@@ -511,11 +511,12 @@ class TestModelRunner:
     def __init_engine(self):
         max_model_leng = self.max_model_len + self.is_multi_modal * MAX_IMG_TOKEN
 
+        tpu_graph_enabled = os.environ.get("PYTORCH_TPU_ALLOCATOR")
         engine_args = EngineArgs(
             model=self.model_id,
             dtype=self.dtype,
             max_model_len=max_model_leng,
-            enforce_eager=True,
+            enforce_eager=False if tpu_graph_enabled else True,
             trust_remote_code=True,
             tensor_parallel_size=self.tp,
             distributed_executor_backend=None if self.tp == 1 else "mp",
@@ -563,10 +564,13 @@ class TestModelRunner:
                 self.engine.tokenizer
             ).gen_test_prompts(batch_size, input_length)
 
-        for repeat_i in range(2):
-            logger.warning(
-                f'================================ Run iter: {repeat_i if repeat_i else "Warmup"} ================================'
-            )
+        tpu_graph_enabled = os.environ.get("PYTORCH_TPU_ALLOCATOR")
+        repeat_iter = 1 if tpu_graph_enabled else 2
+        for repeat_i in range(repeat_iter):
+            if repeat_iter == 2:
+                logger.warning(
+                    f'================ Run iter: {repeat_i if repeat_i else "Warmup"} ================'
+                )
             # sampling_params & prompts
             sampling_params = SamplingParams(
                 max_tokens=max_new_tokens, temperature=0, ignore_eos=True

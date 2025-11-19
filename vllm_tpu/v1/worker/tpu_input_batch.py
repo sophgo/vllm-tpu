@@ -141,6 +141,11 @@ class InputBatch:
         self.num_tokens = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_tokens_no_spec = np.zeros(max_num_reqs, dtype=np.int32)
         self.num_prompt_tokens = np.zeros(max_num_reqs, dtype=np.int32)
+        self.num_computed_tokens = torch.zeros(
+            (max_num_reqs, ),
+            dtype=torch.int32,
+            device=device,
+        )
         self.num_computed_tokens_cpu_tensor = torch.zeros(
             (max_num_reqs, ),
             device="cpu",

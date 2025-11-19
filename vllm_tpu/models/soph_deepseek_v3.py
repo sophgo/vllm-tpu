@@ -15,6 +15,7 @@
 
 from typing import List, Optional, Tuple, Type
 
+import os
 import torch
 import torch.distributed
 from torch import nn
@@ -283,7 +284,7 @@ class DeepseekV3Attention(torch.nn.Module):
             slots = attn_metadata.slot_mapping
             input_lengths = attn_metadata.input_lengths
             cache_lengths = attn_metadata.cache_lengths
-            max_s = input_lengths.max().item()
+            max_s = attn_metadata.max_s
             kv_cache = self.attn.kv_cache[forward_context.virtual_engine]
             torch.ops.my_ops.paged_latent_attention_fp8(
                 attention_output["attn_out"],
@@ -431,7 +432,8 @@ class DeepseekV3MoE(nn.Module):
             self.shared_experts = None
 
     def update_buffer(self, seqlen, device):
-        if seqlen <= self.max_seq_len:
+        tpu_graph_enabled = os.environ.get("PYTORCH_TPU_ALLOCATOR")
+        if not tpu_graph_enabled and seqlen <= self.max_seq_len:
             return
         self.max_seq_len = seqlen
         opts = dict(device=device, dtype=torch.bfloat16)
@@ -695,7 +697,8 @@ class DeepseekV3Model(torch.nn.Module):
         default_device = hidden_states.device
         default_dtype = hidden_states.dtype
 
-        if self.mlp_buffer is None or hidden_states.shape[0] != self.mlp_buffer.shape[0]:
+        tpu_graph_enabled = os.environ.get("PYTORCH_TPU_ALLOCATOR")
+        if tpu_graph_enabled or self.mlp_buffer is None or hidden_states.shape[0] != self.mlp_buffer.shape[0]:
             self.rms_buffer = torch.empty_like(hidden_states)
             self.attn_buffer = {}
             seqlen = hidden_states.shape[0]
@@ -734,7 +737,7 @@ class DeepseekV3Model(torch.nn.Module):
             cu_seqlen_prefill = attn_state not in [
                 SophAttentionState.DecodeOnly, SophAttentionState.SpecDecoding
             ]
-            max_s = attn_metadata.input_lengths.max().item()
+            max_s = attn_metadata.max_s
         else:
             cu_seqlen_prefill = False
 

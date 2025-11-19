@@ -180,6 +180,16 @@ class SophTPUWorker(WorkerBase):
         self.model_runner.load_model()
 
     def compile_or_warm_up_model(self) -> None:
+        warmup_sizes = (self.vllm_config.compilation_config.compile_sizes
+                        or []).copy()
+        if not self.model_config.enforce_eager:
+            warmup_sizes = [
+                x for x in warmup_sizes if x not in
+                self.vllm_config.compilation_config.cudagraph_capture_sizes
+            ]
+        for size in sorted(warmup_sizes, reverse=True):
+            logger.info("Compile and warming up model for size %d", size)
+            self.model_runner._dummy_run(size)
         if not self.model_config.enforce_eager:
             self.model_runner.capture_model()
 
@@ -189,7 +199,7 @@ class SophTPUWorker(WorkerBase):
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
-    
+
     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         return self.model_runner.get_supported_tasks()
 

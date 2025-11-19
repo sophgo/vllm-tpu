@@ -38,7 +38,8 @@ class SophTpuCommunicator(DeviceCommunicatorBase):
 
     def all_gather(self, input_, dim) -> torch.Tensor:
         #fix after, init gather output before model infer
-        if self.gather_outputs is None or self.gather_outputs[0].shape[0] != input_.shape[0]:
+        tpu_graph_enabled = os.environ.get("PYTORCH_TPU_ALLOCATOR")
+        if tpu_graph_enabled or self.gather_outputs is None or self.gather_outputs[0].shape[0] != input_.shape[0]:
             buffer_shape = (self.world_size,) + input_.shape
             full_buffer = input_.new_empty(buffer_shape)
             self.gather_outputs = [full_buffer[i] for i in range(self.world_size)]

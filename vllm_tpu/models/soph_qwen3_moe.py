@@ -178,7 +178,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         return quant_config
  
     def update_buffer(self, seqlen, device):
-        if seqlen <= self.max_seq_len:
+        tpu_graph_enabled = os.environ.get("PYTORCH_TPU_ALLOCATOR")
+        if not tpu_graph_enabled and seqlen <= self.max_seq_len:
             return
         self.max_seq_len = seqlen
  
@@ -485,6 +486,9 @@ class Qwen3MoeModel(nn.Module):
         self.mlp_buffer = None
         self.attn_buffer = None
         self.rms_buffer = None
+        self.query_buffer = None
+        self.key_buffer = None
+        self.value_buffer = None
 
         self.eps = config.rms_norm_eps
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -519,7 +523,8 @@ class Qwen3MoeModel(nn.Module):
         cos = cos.contiguous().unsqueeze(1).repeat(1, 1, 2)
         sin = sin.contiguous().unsqueeze(1).repeat(1, 1, 2)
 
-        if self.mlp_buffer is None or hidden_states.shape[0] != self.mlp_buffer.shape[0]:
+        tpu_graph_enabled = os.environ.get("PYTORCH_TPU_ALLOCATOR")
+        if tpu_graph_enabled or self.mlp_buffer is None or hidden_states.shape[0] != self.mlp_buffer.shape[0]:
             self.mlp_buffer = torch.empty_like(hidden_states)
             # {MM-QKV output, Attention output, Attention_FC output}
             self.attn_buffer = []
@@ -527,17 +532,32 @@ class Qwen3MoeModel(nn.Module):
             self.attn_buffer.append(hidden_states.new_empty(hidden_states.shape[0], self.num_heads // self.tp_size, self.head_dim))
             self.attn_buffer.append(torch.empty_like(hidden_states))
             self.rms_buffer = torch.empty_like(hidden_states)
-        mlp_buffer = self.mlp_buffer
-        self.gathered_experts_out_buf = torch.empty(
+            self.gathered_experts_out_buf = torch.empty(
                 hidden_states.size(0),
                 self.num_experts_per_tok,
                 hidden_states.size(1),
                 device=default_device, dtype=default_dtype)
+            self.query_buffer = torch.empty(
+                hidden_states.shape[0],
+                max(1, self.num_heads // self.tp_size),
+                self.head_dim,
+                dtype = default_dtype, device = default_device)
+            self.key_buffer = torch.empty(
+                hidden_states.shape[0],
+                max(1, self.num_kv_heads // self.tp_size),
+                self.head_dim,
+                dtype = default_dtype, device = default_device)
+            self.value_buffer = torch.empty(
+                hidden_states.shape[0],
+                max(1, self.num_kv_heads // self.tp_size),
+                self.head_dim,
+                dtype = default_dtype, device = default_device)
+        mlp_buffer = self.mlp_buffer
         rms_buffer = self.rms_buffer
         attn_buffer = self.attn_buffer
-        query_buffer = torch.empty(hidden_states.shape[0], max(1, self.num_heads // self.tp_size), self.head_dim, dtype = default_dtype, device = default_device)
-        key_buffer = torch.empty(hidden_states.shape[0], max(1, self.num_kv_heads // self.tp_size), self.head_dim, dtype = default_dtype, device = default_device)
-        value_buffer = torch.empty(hidden_states.shape[0], max(1, self.num_kv_heads // self.tp_size), self.head_dim, dtype = default_dtype, device = default_device)
+        query_buffer = self.query_buffer
+        key_buffer = self.key_buffer
+        value_buffer = self.value_buffer
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]

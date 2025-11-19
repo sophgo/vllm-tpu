@@ -25,6 +25,7 @@
 """Inference-only Qwen2 model compatible with HuggingFace weights."""
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
+import os
 import torch
 from torch import nn
 from transformers import Qwen2Config
@@ -265,7 +266,6 @@ class Qwen2DecoderLayer(nn.Module):
 
         return mlp_buffer, residual
 
-
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -372,7 +372,8 @@ class Qwen2Model(nn.Module):
         cos = cos.contiguous().unsqueeze(1).repeat(1, 1, 2)
         sin = sin.contiguous().unsqueeze(1).repeat(1, 1, 2)
 
-        if self.mlp_buffer is None or hidden_states.shape[0] != self.mlp_buffer.shape[0]:
+        tpu_graph_enabled = os.environ.get("PYTORCH_TPU_ALLOCATOR")
+        if tpu_graph_enabled or self.mlp_buffer is None or hidden_states.shape[0] != self.mlp_buffer.shape[0]:
             self.mlp_buffer = torch.empty_like(hidden_states)
             self.rms_buffer = torch.empty_like(hidden_states)
             self.attn_buffer = []

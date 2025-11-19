@@ -94,6 +94,7 @@ class SophTPUMetadata:
     # or all decoding.
     input_lengths: Optional[torch.Tensor] = None
     cache_lengths: Optional[torch.Tensor] = None
+    max_s: Optional[int] = None
 
     # positional embeddings parameters
     cos: Optional[torch.Tensor] = None
@@ -360,7 +361,19 @@ class SophTPUAttentionBackendImpl(AttentionImpl):
             assert context_lengths.max().item() <= self.sliding_window, \
                 "The context lengths must be less than sliding window for hybrid attention."
 
-        torch.ops.my_ops.paged_attention_v2(
+        attn_state = attn_metadata.attn_state
+        cu_seqlen_prefill = attn_state not in [
+            SophAttentionState.DecodeOnly, SophAttentionState.SpecDecoding
+        ]
+        is_prefill = cu_seqlen_prefill is not None
+        input_lengths = attn_metadata.input_lengths
+        cache_lengths = attn_metadata.cache_lengths
+        cpu_lengths = input_lengths.device.type == 'cpu'
+        opts = [0, 0]
+        if not cpu_lengths:
+            opts = [attn_metadata.max_s, (2 if is_prefill else 3)]
+
+        torch.ops.my_ops.paged_attention_v3(
             attn_output,
             query,
             key,
@@ -374,6 +387,7 @@ class SophTPUAttentionBackendImpl(AttentionImpl):
             attn_metadata.slot_mapping,
             attn_metadata.block_tables,
             None,
-            self.scale
+            self.scale,
+            *opts
         )
         return attn_output

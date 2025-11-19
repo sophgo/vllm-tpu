@@ -108,6 +108,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunne
 
 from vllm_sophon.attention.attention import SophAttentionState, SophTPUMetadata
 from vllm_sophon.v1.worker.tpu_input_batch import CachedRequestState, InputBatch
+from vllm_sophon.compilation.tpu_graph import TPUGraphWrapper
 
 from vllm.attention.layer import Attention
 from vllm.config import CompilationLevel
@@ -124,7 +125,7 @@ import torch_tpu
 
 @dataclass
 class GraphCaptureContext:
-    #stream: torch.npu.Stream
+    #stream: torch.tpu.Stream
     stream: torch_tpu.tpu.Stream
 
 
@@ -144,7 +145,7 @@ def graph_capture(device: torch.device):
     from other kernels possibly launched on background in the default stream.
     """
     graph_capture_context = GraphCaptureContext(
-        torch.npu.Stream(device=device))
+        torch.tpu.Stream(device=device))
     stream = graph_capture_context.stream
 
     # we use nullcontext now
@@ -152,11 +153,11 @@ def graph_capture(device: torch.device):
 
     # ensure all initialization operations complete before attempting to
     # capture the graph on another stream
-    curr_stream = torch.npu.current_stream()
+    curr_stream = torch.tpu.current_stream()
     if curr_stream != stream:
         stream.wait_stream(curr_stream)
 
-    with torch.npu.stream(stream), maybe_ca_context:
+    with torch.tpu.Stream(stream), maybe_ca_context:
         yield graph_capture_context
 
 
@@ -174,15 +175,15 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         self._invalid_req_indices = invalid_req_indices
 
         # Event on the copy stream so we can synchronize the non-blocking copy.
-        self._async_copy_ready_event = torch.npu.Event()
+        self._async_copy_ready_event = torch.tpu.Event()
 
         # Keep a reference to the device tensor to avoid it being
         # deallocated until we finish copying it to the host.
         self._sampled_token_ids = sampled_token_ids
 
         # Initiate the copy on a separate stream, but do not synchronize it.
-        default_stream = torch.npu.current_stream()
-        with torch.npu.stream(async_output_copy_stream):
+        default_stream = torch.tpu.current_stream()
+        with torch.tpu.stream(async_output_copy_stream):
             async_output_copy_stream.wait_stream(default_stream)
             self._sampled_token_ids_cpu = self._sampled_token_ids.to(
                 'cpu', non_blocking=True)
@@ -238,10 +239,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         self.dcp_size = get_dcp_group().world_size
         self.dcp_rank = get_dcp_group().rank_in_group
         self.device = device
-        #if envs_ascend.VLLM_ASCEND_ENABLE_PREFETCH_MLP:
-        #    self.prefetch_stream = torch.npu.Stream(device=device)
-        #else:
-            #self.prefetch_stream = None
+        self.prefetch_stream = None
         self.dtype = self.model_config.dtype
         from vllm.v1.sample.sampler import Sampler
         self.sampler = Sampler()
@@ -410,6 +408,16 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
                                         device="cpu",
                                         pin_memory=self.pin_memory)
         self.seq_lens_np = self.seq_lens_cpu.numpy()
+
+        self.num_scheduled_tokens = torch.zeros(self.max_num_reqs,
+                                                dtype=torch.int32,
+                                                device=self.device)
+        self.num_scheduled_tokens_cpu = torch.zeros(self.max_num_reqs,
+                                                    dtype=torch.int32,
+                                                    device="cpu",
+                                                    pin_memory=self.pin_memory)
+        self.num_scheduled_tokens_np = self.num_scheduled_tokens_cpu.numpy()
+
         self.pcp_allgather_restore_idx = torch.zeros(self.max_num_tokens,
                                                      dtype=torch.int32,
                                                      device=self.device)
@@ -437,7 +445,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         self.dynamic_eplb = False
 
         self.use_async_scheduling = self.scheduler_config.async_scheduling
-        self.async_output_copy_stream = torch.npu.Stream() if \
+        self.async_output_copy_stream = torch.tpu.Stream() if \
             self.use_async_scheduling else None
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -539,8 +547,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
             self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
 
     def _use_tpugraph(self) -> bool:
-        return None #no use graph
-        # return self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and self.compilation_config.level == CompilationLevel.PIECEWISE and not self.model_config.enforce_eager
+        return self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and not self.model_config.enforce_eager
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         # Remove finished requests from the cached states.
@@ -789,6 +796,8 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
 
     def get_model(self) -> nn.Module:
         # get raw model out of the tpugraph wrapper.
+        if isinstance(self.model, TPUGraphWrapper):
+            return self.model.unwrap()
         return self.model
 
     def get_supported_generation_tasks(self) -> "list[GenerationTask]":
@@ -1123,25 +1132,14 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         req_ids = self.input_batch.req_ids
         tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
         num_scheduled_tokens = np.array(tokens, dtype=np.int32)
-
-        req_indices = np.repeat(self.arange_np[:num_reqs],
-                                num_scheduled_tokens)
-        _, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-        positions_np = np.add(
-            self.input_batch.num_computed_tokens_cpu[req_indices],
-            arange,
-        )
-
-        self.input_batch.block_table.compute_slot_mapping(
-            req_indices, positions_np)
-        num_scheduled_tokens = np.array(tokens, dtype=np.int32)
-        # update total_num_scheduled_tokens
         total_num_scheduled_tokens = sum(num_scheduled_tokens[:num_reqs])
-        self.input_batch.block_table.commit_slot_mapping(
-            total_num_scheduled_tokens)
+        max_num_scheduled_tokens = max(tokens)
+
+        self.num_scheduled_tokens_np[:num_reqs] = num_scheduled_tokens
+        self.num_scheduled_tokens[:num_reqs].copy_(self.num_scheduled_tokens_cpu[:num_reqs], non_blocking=True)
+        self.num_scheduled_tokens[num_reqs:].fill_(0)
 
         total_num_pcp_pads = sum(self.num_pcp_pads)
-        max_num_scheduled_tokens = max(tokens)
         num_valid_tokens = np.array([
             num_tokens -
             len(scheduler_output.scheduled_spec_decode_tokens.get(i, []))
@@ -1149,7 +1147,14 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         ],
                                     dtype=np.int32)
 
-        num_input_tokens = total_num_scheduled_tokens
+        if (self.use_tpugraph and total_num_scheduled_tokens
+                <= self.tpugraph_batch_sizes[-1]):
+            # Add padding to the batch size.
+            num_input_tokens = self.vllm_config.pad_for_cudagraph(
+                total_num_scheduled_tokens)
+        else:
+            # Eager mode.
+            num_input_tokens = total_num_scheduled_tokens
 
         # Get the attention state.
         attn_state = self._build_attn_state(num_reqs, num_scheduled_tokens,
@@ -1158,9 +1163,9 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
 
         # Determine if it's a splitfuse batch
         with_prefill = attn_state not in [
-            #AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
             SophAttentionState.DecodeOnly, SophAttentionState.SpecDecoding
         ]
+        self.with_prefill = with_prefill
 
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         enable_dbo = False
@@ -1174,6 +1179,9 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         (maybe_padded_num_tokens, num_tokens_across_dp, with_prefill,
          enable_dbo) = self._sync_metadata_across_dp(num_input_tokens,
                                                      with_prefill, enable_dbo)
+
+        self.num_tokens_across_dp = num_tokens_across_dp
+        self._update_graph_pad_size(with_prefill, maybe_padded_num_tokens)
 
         # TODO: Now that num_input_tokens is basically identical with maybe_padded_num_tokens
         # We should consider removing maybe_padded_num_tokens later
@@ -1198,6 +1206,11 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         np.add(self.input_batch.num_computed_tokens_cpu[req_indices],
                arange,
                out=positions_np)
+
+        self.input_batch.block_table.compute_slot_mapping(
+            req_indices, positions_np)
+        self.input_batch.block_table.commit_slot_mapping(
+            total_num_scheduled_tokens)
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1229,51 +1242,19 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         self.query_start_loc_np[1:num_reqs + 1] = cu_num_tokens
         self.query_start_loc[:num_reqs + 1].copy_(
             self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
+        self.query_start_loc[num_reqs + 1:].fill_(-1)
 
         self.seq_lens_np[:num_reqs] = (
             self.input_batch.num_computed_tokens_cpu[:num_reqs] +
             num_scheduled_tokens)
         self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
                                        non_blocking=True)
-
-        # Fill unused with -1. Needed for reshape_and_cache
-        self.query_start_loc[num_reqs + 1:].fill_(-1)
         self.seq_lens[num_reqs:].fill_(0)
-
-        self.query_lens = torch.from_numpy(num_scheduled_tokens)
-
-        # Copy the tensors to the NPU.
-        self.input_ids[:total_num_scheduled_tokens].copy_(
-            self.input_ids_cpu[:total_num_scheduled_tokens], non_blocking=True)
 
         self.positions_cpu[total_num_scheduled_tokens:num_input_tokens].zero_()
         self.positions[:num_input_tokens].copy_(
             self.positions_cpu[:num_input_tokens], non_blocking=True)
 
-        # Make Attention metadata
-        positions_cpu = self.positions_cpu[:num_input_tokens]
-        positions = self.positions[:num_input_tokens]
-        seq_lens_cpu = self.seq_lens_cpu[:num_reqs]
-
-        attn_state = self._build_attn_state(num_reqs, num_scheduled_tokens,
-                                            num_valid_tokens)
-        #self.attn_mask = self._make_attention_mask(seq_lens=seq_lens_cpu,
-        #                                           position=positions_cpu,
-        #                                           attn_state=attn_state)
-        self.attn_state = attn_state  # type: ignore
-
-        self.with_prefill = with_prefill
-        self.num_tokens_across_dp = num_tokens_across_dp
-        self._update_graph_pad_size(with_prefill, maybe_padded_num_tokens)
-        attn_metadata: dict[str, Any] = {}
-
-        # Prepare input_ids
-        token_indices = (positions_np +
-                         req_indices * self.input_batch.token_ids_cpu.shape[1])
-        torch.index_select(self.input_batch.token_ids_cpu_tensor.flatten(),
-                           0,
-                           torch.from_numpy(token_indices),
-                           out=self.input_ids_cpu[:total_num_scheduled_tokens])
         # Copy the tensors to the NPU.
         self._prepare_input_ids(total_num_scheduled_tokens, cu_num_tokens)
 
@@ -1294,7 +1275,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
                     input_ids, mm_embeds)
             else:
                 inputs_embeds = self.model.get_input_embeddings(input_ids)
- 
+
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds[:total_num_scheduled_tokens].copy_(
                 inputs_embeds)
@@ -1304,13 +1285,12 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
             # multimodal models, it is not desirable for performance since
-            # then the embedding layer is not included in the ACL graph.
+            # then the embedding layer is not included in the TPU graph.
             input_ids = self.input_ids[:num_input_tokens]
             inputs_embeds = None
         positions = self.positions[:num_input_tokens]
-        input_ids, positions = self._update_input_ids_and_positions(
-            input_ids, positions, num_input_tokens, with_prefill,
-            maybe_padded_num_tokens)
+        if self.uses_mrope:
+            positions = self.mrope_positions[:, :num_input_tokens].contiguous()
 
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
@@ -1357,10 +1337,6 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
             self.num_draft_tokens.np[num_reqs:].fill(0)
             self.num_draft_tokens.copy_to_gpu()
 
-        # Used in the below loop.
-        # query_start_loc_cpu = self.query_start_loc.cpu[:num_reqs + 1]
-        num_computed_tokens_cpu = (
-            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs])
         spec_decode_common_attn_metadata = None
         if use_spec_decode and self.need_accepted_tokens:
             self.num_accepted_tokens.np[:num_reqs] = (
@@ -1368,6 +1344,12 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.num_accepted_tokens.copy_to_gpu()
 
+        attn_metadata: dict[str, Any] = {}
+        self.input_batch.num_computed_tokens[:num_reqs].copy_(
+            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs], non_blocking=True)
+
+        attn_metadata_cache_lengths=self.input_batch.num_computed_tokens[:num_reqs] if self.use_tpugraph else self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+        attn_metadata_input_lengths=self.num_scheduled_tokens[:num_reqs] if self.use_tpugraph else self.num_scheduled_tokens_cpu[:num_reqs]
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
@@ -1400,55 +1382,14 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
                 )
                 self.slot_mapping[slot_mapping_size:].fill_(0)
 
-            """
-            common_attn_metadata = SophTPUCommonAttentionMetadata(
-                query_start_loc=self.query_start_loc[:num_reqs + 1],
-                query_start_loc_cpu=self.query_start_loc_cpu[:num_reqs + 1],
-                seq_lens_cpu=self.seq_lens_cpu,
-                seq_lens=self.seq_lens_cpu[:num_reqs],
-                block_table_tensor=blk_table_tensor[:num_reqs],
-                slot_mapping=self.slot_mapping,
-                cache_lengths=num_computed_tokens,
-                input_lengths=num_scheduled_tokens
-            )
-            """
-
-            #if self.speculative_config and \
-            #    spec_decode_common_attn_metadata is None:
-            #    spec_decode_common_attn_metadata = common_attn_metadata
-
             for attn_group in self.attn_groups[kv_cache_group_id]:
-                #common_prefix_len = 0
-                #extra_attn_metadata_args = {}
-                #builder = attn_group.get_metadata_builder()
-                #if isinstance(builder, GDNAttentionMetadataBuilder
-                #              ) or self.model_config.runner_type == "pooling":
-                #    if use_spec_decode:
-                #        extra_attn_metadata_args = dict(
-                #            num_accepted_tokens=self.num_accepted_tokens.
-                #            gpu[:num_reqs],
-                #            num_draft_tokens=self.num_draft_tokens.
-                #            gpu[:num_reqs],
-                #        )
-                #    attn_metadata_i = builder.build(
-                #        common_prefix_len=common_prefix_len,
-                #        common_attn_metadata=common_attn_metadata,
-                #        **extra_attn_metadata_args)
-                #else:
-                #    attn_metadata_i = builder.build(
-                #        common_prefix_len=common_prefix_len,
-                #        common_attn_metadata=common_attn_metadata,
-                #        model=self.get_model(),
-                #        **extra_attn_metadata_args)
-
-                # input_length_cpu = torch.from_numpy(num_scheduled_tokens).cpu()
-
                 attn_metadata_i = SophTPUMetadata(
                     attn_state=self.attn_state,
                     slot_mapping=self.slot_mapping,
                     block_tables=blk_table_tensor[:num_reqs],
-                    cache_lengths=num_computed_tokens_cpu,
-                    input_lengths=self.query_lens)
+                    cache_lengths=attn_metadata_cache_lengths,
+                    input_lengths=attn_metadata_input_lengths,
+                    max_s=max_num_scheduled_tokens)
 
                 for layer_name in attn_group.layer_names:
                     attn_metadata[layer_name] = attn_metadata_i
@@ -1465,35 +1406,14 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
                 input_ids, inputs_embeds, intermediate_tensors,
                 max_num_scheduled_tokens)
 
-    def _generate_process_reqs_hidden_states(self, attn_metadata, with_prefill,
-                                             maybe_padded_num_tokens,
-                                             input_ids, positions,
-                                             intermediate_tensors,
-                                             inputs_embeds):
-        assert self.model is not None
-        hidden_states = self.model(
-            input_ids=input_ids,
-            positions=positions,
-            intermediate_tensors=intermediate_tensors,
-            inputs_embeds=inputs_embeds,
-        )
-
-        return hidden_states
-
     def _build_attn_state(self, num_reqs, num_scheduled_tokens,
                           num_valid_tokens):
-        #ascend_config = get_ascend_config()
-        if np.array_equal(self.seq_lens_np[:num_reqs], num_scheduled_tokens):
-            #attn_state = AscendAttentionState.PrefillNoCache
+        if np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0):
             attn_state = SophAttentionState.PrefillOnly
         # We assume it is the decode stage, where prefill occurs but only one token is not hit in cache.
         elif np.all(num_scheduled_tokens == 1):
-            #attn_state = AscendAttentionState.DecodeOnly
             attn_state = SophAttentionState.DecodeOnly
             if self.speculative_config and self.speculative_config.method == 'deepseek_mtp':
-                # SpecDecoding now supports seq_len=1 and seq_len=2
-                # In Prefilling Decoding Disaggregation scenario, SpecDecoding need to supports seq_len=1
-                #attn_state = AscendAttentionState.SpecDecoding
                 attn_state = SophAttentionState.SpecDecoding
         else:
             attn_state = SophAttentionState.ChunkedPrefill
@@ -1501,13 +1421,6 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
 
     def _update_graph_pad_size(self, with_prefill, graph_pad_size):
         self.graph_pad_size = -1
-
-    def _update_input_ids_and_positions(self, input_ids, positions,
-                                        num_input_tokens, with_prefill,
-                                        maybe_padded_num_tokens):
-        if self.uses_mrope:
-            positions = self.mrope_positions[:, :num_input_tokens].contiguous()
-        return input_ids, positions
 
     def _calc_spec_decode_metadata(
         self,
@@ -1706,7 +1619,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
             lambda x: x.to("cpu", non_blocking=True),
             raw_pooler_output,
         )
-        torch.npu.synchronize()
+        torch.tpu.synchronize()
 
         pooler_output: list[Optional[torch.Tensor]] = []
         for raw_output, seq_len, prompt_len in zip(
@@ -1766,9 +1679,11 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         ):
             self.maybe_setup_kv_connector(scheduler_output)
 
-            hidden_states = self._generate_process_reqs_hidden_states(
-                attn_metadata, self.with_prefill, maybe_padded_num_tokens,
-                input_ids, positions, intermediate_tensors, inputs_embeds)
+            hidden_states = self.model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds)
 
         self.maybe_wait_for_kv_save()
         finished_sending, finished_recving = self.get_finished_kv_transfer(
@@ -2014,7 +1929,6 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
 
     def kv_connector_no_forward(
             self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:
-        #with set_ascend_forward_context(None, self.vllm_config):
         with set_forward_context(None, self.vllm_config):
             self.maybe_setup_kv_connector(scheduler_output)
             finished_sending, finished_recving = (
@@ -2073,82 +1987,50 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
 
             attn_metadata = {}
 
-            seq_lens = self.model_config.max_model_len
-            self.seq_lens_np[:num_reqs] = seq_lens
-            self.seq_lens_np[num_reqs:] = 0
+            max_s = num_scheduled_tokens.max().item()
 
-            num_computed_tokens_cpu = (
-                self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs])
+            #cache_lengths=self.input_batch.num_computed_tokens[:num_reqs] if self.use_tpugraph else self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+            #input_lengths=self.num_scheduled_tokens[:num_reqs] if self.use_tpugraph else self.num_scheduled_tokens_cpu[:num_reqs]
+
+            num_computed_tokens = self.model_config.max_model_len - num_scheduled_tokens
+            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs] = torch.from_numpy(num_computed_tokens)
+            self.input_batch.num_computed_tokens[:num_reqs].copy_(self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs])
+            self.input_batch.num_computed_tokens[num_reqs:].fill_(0)
+
+
+            self.num_scheduled_tokens_np[:num_reqs] = num_scheduled_tokens
+            self.num_scheduled_tokens[:num_reqs].copy_(self.num_scheduled_tokens_cpu[:num_reqs], non_blocking=True)
+            self.num_scheduled_tokens[num_reqs:].fill_(0)
+
+            cache_lengths=self.input_batch.num_computed_tokens[:num_reqs] if self.use_tpugraph else self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+            input_lengths=self.num_scheduled_tokens[:num_reqs] if self.use_tpugraph else self.num_scheduled_tokens_cpu[:num_reqs]
 
             for kv_cache_group_id, kv_cache_group_spec in enumerate(
                     self.kv_cache_config.kv_cache_groups):
+
+                blk_table = self.input_batch.block_table[kv_cache_group_id]
                 block_table_tensor = self.input_batch.block_table[
                     kv_cache_group_id].get_device_tensor()
-                #common_attn_metadata = AscendCommonAttentionMetadata(
-                #    query_start_loc=torch.tensor(
-                #        [0] + self.actual_seq_lengths_q[:num_reqs],
-                #        device=self.device,
-                #        dtype=torch.int32),
-                #    query_start_loc_cpu=self.query_start_loc_cpu[:num_reqs +
-                #                                                 1],
-                #    seq_lens_cpu=self.seq_lens_cpu,
-                #    seq_lens=self.seq_lens_cpu[:num_reqs],
-                #    num_reqs=num_reqs,
-                #    num_actual_tokens=num_tokens,
-                #    actual_seq_lengths_q=self.actual_seq_lengths_q,
-                #    block_table_tensor=block_table_tensor[:num_reqs],
-                #    slot_mapping=self.slot_mapping,
-                #    num_computed_tokens_cpu=num_computed_tokens_cpu,
-                #    positions=self.positions,
-                #    #attn_mask=self.attn_mask,
-                #    spec_attn_mask=self.spec_attn_mask,
-                #    attn_state=self.attn_state,
-                #    max_query_len=max_query_len,
-                #    decode_token_per_req=self.decode_token_per_req,
-                #    cos=self.cos,
-                #    sin=self.sin,
-                #)
-                #attn_state = AscendAttentionState.DecodeOnly
-                #attn_state = SophAttentionState.DecodeOnly
-                if self.speculative_config and \
-                        self.speculative_config.method == "deepseek_mtp":
-                    #attn_state = AscendAttentionState.SpecDecoding
-                    attn_state = SophAttentionState.SpecDecoding
 
                 for attn_group in self.attn_groups[kv_cache_group_id]:
-                    #builder = attn_group.get_metadata_builder()
-                    #attn_metadata_i = builder.build_for_graph_capture(
-                    #    common_attn_metadata, attn_state, self.get_model())
-                    # input_length_cpu = torch.from_numpy(num_scheduled_tokens).cpu
                     attn_metadata_i = SophTPUMetadata(
-                        attn_state=self.attn_state,
-                        slot_mapping=self.slot_mapping,
+                        attn_state=SophAttentionState.DecodeOnly,
                         block_tables=block_table_tensor[:num_reqs],
-                        cache_lengths=num_computed_tokens_cpu,
-                        input_lengths=self.query_lens)
+                        slot_mapping=self.slot_mapping,
+                        cache_lengths=cache_lengths,
+                        input_lengths=input_lengths,
+                        max_s=max_s)
 
                     for layer_name in kv_cache_group_spec.layer_names:
                         attn_metadata[layer_name] = attn_metadata_i
 
         return attn_metadata
 
-    def _generate_dummy_run_hidden_states(self, with_prefill,
-                                          is_torchair_compile, input_ids,
-                                          positions, attn_metadata, num_tokens,
-                                          intermediate_tensors, inputs_embeds):
-        hidden_states = self.model(input_ids=input_ids,
-                                   positions=positions,
-                                   intermediate_tensors=intermediate_tensors,
-                                   inputs_embeds=inputs_embeds)
-        hidden_states = hidden_states
-        return hidden_states
-
     @torch.inference_mode()
     def _dummy_run(
         self,
         num_tokens: int,
         with_prefill: bool = False,
-        is_torchair_compile: bool = False,
         tpugraph_runtime_mode: Optional[CUDAGraphMode] = None,
         force_attention: bool = False,
         uniform_decode: bool = False,
@@ -2199,14 +2081,15 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
             min_tokens_per_req = num_tokens // num_reqs
             num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
             num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+
         assert sum(num_scheduled_tokens_list) == num_tokens
         assert len(num_scheduled_tokens_list) == num_reqs
         num_scheduled_tokens = np.array(num_scheduled_tokens_list,
                                         dtype=np.int32)
 
         # Force dummy run on prefill stage when this node is deemed as kv producer.
-        if self.is_kv_producer and not self.is_kv_consumer:
-            with_prefill = True
+        #if self.is_kv_producer and not self.is_kv_consumer:
+        #    with_prefill = True
 
         with self.maybe_dummy_run_with_lora(self.lora_config,
                                             num_scheduled_tokens):
@@ -2237,7 +2120,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
                 })
 
             # filter out the valid batch descriptor
-            _ag_mode, batch_descriptor = \
+            _tg_mode, batch_descriptor = \
                 self.tpugraph_dispatcher.dispatch(
                     BatchDescriptor(num_tokens=num_tokens,
                                     uniform_decode=uniform_decode))
@@ -2245,11 +2128,11 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
                 # we allow forcing NONE when the dispatcher disagrees to support
                 # warm ups for tpugraph capture
                 assert tpugraph_runtime_mode == CUDAGraphMode.NONE or \
-                    tpugraph_runtime_mode == _ag_mode, (
-                    f"Aclgraph runtime mode mismatch at dummy_run. "
-                    f"Expected {_ag_mode}, but got {tpugraph_runtime_mode}.")
+                    tpugraph_runtime_mode == _tg_mode, (
+                    f"TPUgraph runtime mode mismatch at dummy_run. "
+                    f"Expected {_tg_mode}, but got {tpugraph_runtime_mode}.")
             else:
-                tpugraph_runtime_mode = _ag_mode
+                tpugraph_runtime_mode = _tg_mode
 
             # TODO: Set create_mixed_batch to False since it's only used in FI warmup
             # and not supported now. We could remove it in the future.
@@ -2271,27 +2154,11 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
                     cudagraph_runtime_mode=tpugraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
             ):
-                hidden_states = self._generate_dummy_run_hidden_states(
-                    with_prefill, is_torchair_compile, input_ids, positions,
-                    attn_metadata, num_tokens, intermediate_tensors,
-                    inputs_embeds)
- 
-            #if self.drafter:
-            #    self.drafter.dummy_run(
-            #        num_tokens=num_tokens,
-            #        with_prefill=with_prefill,
-            #        skip_attn=True,
-            #        num_reqs=num_reqs,
-            #        num_tokens_across_dp=num_tokens_across_dp,
-            #        tpugraph_runtime_mode=tpugraph_runtime_mode,
-            #        batch_descriptor=batch_descriptor)
-            #    if need_dummy_logits:
-            #        dummy_compute_logits(hidden_states)
-            #if self.in_profile_run and self.dynamic_eplb:
-            #    self.model.clear_all_moe_loads()
-            #if not self.in_profile_run and self.dynamic_eplb:
-            #    self.eplb_updator.take_update_info_from_eplb_process()
-            #    self.eplb_updator.forward_end()
+                hidden_states = self.model(input_ids=input_ids,
+                                           positions=positions,
+                                           intermediate_tensors=intermediate_tensors,
+                                           inputs_embeds=inputs_embeds)
+
             return hidden_states
 
     @contextmanager
@@ -2332,7 +2199,6 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states = hidden_states[logit_indices]
                 output = self.model.compute_logits(hidden_states)
 
-        #NPUPlatform.synchronize()
         torch_tpu.tpu.synchronize()
         del hidden_states, output
         self.encoder_cache.clear()
@@ -2425,11 +2291,11 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
             self.model = self.load_lora_model(self.model, self.vllm_config,
                                                   self.device)
 
-        # torch.tpu.synchronize()
-        # torch.tpu.empty_cache()
-        # torch.tpu.start_cache()
-
         # wrap the model with full graph wrapper if needed.
+        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            self.model = TPUGraphWrapper(self.model,
+                                         self.vllm_config,
+                                         runtime_mode=CUDAGraphMode.FULL)
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
@@ -2534,7 +2400,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
                 else:
 
                     # In order to transfer kv cache through the reigster_memory api from llmdatadist, the memory
-                    # address should be aligned by 2M. In most case, torch_npu can allocate 2M aligned memory, but
+                    # address should be aligned by 2M. In most case, torch_tpu can allocate 2M aligned memory, but
                     # we found there are also some exceptions during test, so we manual align those memory here, this part
                     # of code may consume 2M * 2 * elem_size memory every layer.
                     nope_allocate_shape = num_blocks * block_size * num_kv_heads * nope_dim
@@ -2627,7 +2493,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
                 else:
 
                     # In order to transfer kv cache through the reigster_memory api from llmdatadist, the memory
-                    # address should be aligned by 2M. In most case, torch_npu can allocate 2M aligned memory, but
+                    # address should be aligned by 2M. In most case, torch_tpu can allocate 2M aligned memory, but
                     # we found there are also some exceptions during test, so we manual align those memory here, this part
                     # of code may consume 2M * 2 * elem_size memory every layer.
                     kv_allocate_shape = num_blocks * block_size * kv_lora_rank
@@ -3060,8 +2926,6 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
                 # or enable more requests to be processed simultaneously.
                 self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
                 continue
-            #if isinstance(attn_module, AscendMultiHeadLatentAttention):
-            #    continue
 
             # TODO: Support other attention modules, e.g., cross-attention
             # TODO(lucas): move the attention specs into the model layers like
@@ -3124,55 +2988,81 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         return kv_cache_spec
 
     def initialize_tpugraph_capture(self) -> None:
-        min_ag_support = AttentionCGSupport.ALWAYS
-        min_ag_builder_name = None
-
-        for attn_group in self._attn_group_iterator():
-            builder = attn_group.get_metadata_builder()
-            if builder.tpugraph_support.value < min_ag_support.value:
-                min_ag_support = builder.tpugraph_support
-                min_ag_builder_name = builder.__class__.__name__
-
-        # This is an imitation of compilation_config.splitting_ops_contain_attention()
-        splitting_ops_contain_attention = (
-            self.compilation_config.splitting_ops is not None
-            and all(op in self.compilation_config.splitting_ops for op in [
-                "vllm.unified_ascend_attention_with_output",
-                "vllm.mla_forward",
-            ]))
+        min_cg_support = AttentionCGSupport.ALWAYS
+        min_cg_builder_name = None
 
         # Flexible resolve the tpugraph mode
-        tpugraph_mode = self.compilation_config.cudagraph_mode
+        cudagraph_mode = self.compilation_config.cudagraph_mode
         # check graph for mixed batch is supported
-        if tpugraph_mode.mixed_mode() == CUDAGraphMode.FULL \
-            and min_ag_support != AttentionCGSupport.ALWAYS:
-            msg = (f"ACLGraphMode.{tpugraph_mode.name} is not supported "
-                   f"with {min_ag_builder_name} backend (support: "
-                   f"{min_ag_support})")
-            if min_ag_support == AttentionCGSupport.NEVER:
+        if cudagraph_mode.mixed_mode() == CUDAGraphMode.FULL \
+            and min_cg_support != AttentionCGSupport.ALWAYS:
+            msg = (f"TPUGraphMode.{cudagraph_mode.name} is not supported "
+                   f"with {min_cg_builder_name} backend (support: "
+                   f"{min_cg_support})")
+            if min_cg_support == AttentionCGSupport.NEVER:
                 # if not supported any full graphs, just raise it.
                 msg += "; please try cudagraph_mode=PIECEWISE, and "\
                     "make sure compilation level is piecewise"
                 raise ValueError(msg)
 
             # attempt to resolve the full graph related mode
-            if splitting_ops_contain_attention:
+            #if splitting_ops_contain_attention:
+            if self.compilation_config.splitting_ops_contain_attention():
                 msg += "; setting cudagraph_mode=FULL_AND_PIECEWISE"
-                tpugraph_mode = self.compilation_config.cudagraph_mode = (
+                cudagraph_mode = self.compilation_config.cudagraph_mode = (
                     CUDAGraphMode.FULL_AND_PIECEWISE)
             else:
                 msg += "; setting cudagraph_mode=FULL_DECODE_ONLY"
-                tpugraph_mode = self.compilation_config.cudagraph_mode = (
+                cudagraph_mode = self.compilation_config.cudagraph_mode = (
                     CUDAGraphMode.FULL_DECODE_ONLY)
             logger.warning(msg)
 
+        # check that if we are doing decode full-cudagraphs it is supported
+        if (cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+                and min_cg_support == AttentionCGSupport.NEVER):
+            msg = (f"CUDAGraphMode.{cudagraph_mode.name} is not supported "
+                   f"with {min_cg_builder_name} backend (support: "
+                   f"{min_cg_support})")
+            if (self.compilation_config.level == CompilationLevel.PIECEWISE and
+                (self.compilation_config.splitting_ops_contain_attention()
+                 or self.compilation_config.use_inductor_graph_partition)):
+                msg += "; setting cudagraph_mode=PIECEWISE because "\
+                    "attention is compiled piecewise"
+                cudagraph_mode = self.compilation_config.cudagraph_mode = \
+                    CUDAGraphMode.PIECEWISE
+            else:
+                msg += "; setting cudagraph_mode=NONE because "\
+                    "attention is not compiled piecewise"
+                cudagraph_mode = self.compilation_config.cudagraph_mode = \
+                    CUDAGraphMode.NONE
+            logger.warning(msg)
+
+        # check that if we are doing spec-decode + decode full-cudagraphs it is
+        # supported
+        if (cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+                and self.uniform_decode_query_len > 1 and min_cg_support.value
+                < AttentionCGSupport.UNIFORM_BATCH.value):
+            msg = (f"CUDAGraphMode.{cudagraph_mode.name} is not supported"
+                   f" with spec-decode for attention backend "
+                   f"{min_cg_builder_name} (support: {min_cg_support})")
+            if self.compilation_config.splitting_ops_contain_attention():
+                msg += "; setting cudagraph_mode=PIECEWISE"
+                cudagraph_mode = self.compilation_config.cudagraph_mode = \
+                    CUDAGraphMode.PIECEWISE
+            else:
+                msg += "; setting cudagraph_mode=NONE"
+                cudagraph_mode = self.compilation_config.cudagraph_mode = \
+                    CUDAGraphMode.NONE
+            logger.warning(msg)
+
+
         # double check that we can support full graph if they are requested
         # even after automatic downgrades
-        if tpugraph_mode.has_full_cudagraphs() \
-            and min_ag_support == AttentionCGSupport.NEVER:
-            raise ValueError(f"CUDAGraphMode.{tpugraph_mode.name} is not "
-                             f"supported with {min_ag_builder_name} backend ("
-                             f"support:{min_ag_support}) "
+        if cudagraph_mode.has_full_cudagraphs() \
+            and min_cg_support == AttentionCGSupport.NEVER:
+            raise ValueError(f"CUDAGraphMode.{cudagraph_mode.name} is not "
+                             f"supported with {min_cg_builder_name} backend ("
+                             f"support:{min_cg_support}) "
                              "; please try cudagraph_mode=PIECEWISE, "
                              "and make sure compilation level is piecewise")
 
@@ -3190,44 +3080,45 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         # Only rank 0 should print progress bar during capture
         if is_global_first_rank():
             logger.info(
-                "Starting to capture ACL graphs for cases: %s, "
+                "Starting to capture TPU graphs for cases: %s, "
                 "mode: %s, uniform_decode: %s", compilation_cases,
                 tpugraph_runtime_mode.name, uniform_decode)
             compilation_cases = tqdm(
                 compilation_cases,
                 disable=not self.load_config.use_tqdm_on_load,
-                desc="Capturing ACL graphs ({}, {})".format(
+                desc="Capturing TPU graphs ({}, {})".format(
                     "decode" if uniform_decode else "mixed prefill-decode",
                     tpugraph_runtime_mode.name))
         # We skip EPLB here since we don't want to record dummy metrics
         for num_tokens in compilation_cases:
-            for _ in range(self.compilation_config.cudagraph_num_of_warmups):
+            #for _ in range(self.compilation_config.cudagraph_num_of_warmups):
                 # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
                 # But be careful, warm up with `NONE`is orthogonal to
                 # if we want to warm up attention or not. This is
                 # different from the case where `FULL` implies capture
                 # attention while `PIECEWISE` implies no attention.
-                force_attention = (tpugraph_runtime_mode == CUDAGraphMode.FULL)
-                self._dummy_run(num_tokens,
-                                tpugraph_runtime_mode=CUDAGraphMode.NONE,
-                                force_attention=force_attention,
-                                uniform_decode=uniform_decode)
+                #force_attention = (tpugraph_runtime_mode == CUDAGraphMode.FULL)
+                #self._dummy_run(self.max_num_tokens,
+                #                tpugraph_runtime_mode=CUDAGraphMode.NONE,
+                #                force_attention=force_attention,
+                #                uniform_decode=uniform_decode)
             self._dummy_run(num_tokens,
                             tpugraph_runtime_mode=tpugraph_runtime_mode,
-                            force_attention=force_attention,
                             uniform_decode=uniform_decode)
 
-    def _capture_model(self):
+    def capture_model(self):
         if not self.use_tpugraph:
             logger.warning(
-                "Skipping ACL graph capture. To turn on ACL graph capture, "
-                "ensure `aclraph_mode` was not manually set to `NONE`")
+                "Skipping TPU graph capture. To turn on TPU graph capture, "
+                "ensure `tpugraph_mode` was not manually set to `NONE`")
             return
         else:
             self.initialize_tpugraph_capture()
 
+        compilation_counter.num_gpu_runner_capture_triggers += 1
+
         set_cudagraph_capturing_enabled(True)
-        # Trigger ACL graph capture for specific shapes.
+        # Trigger TPU graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
         with graph_capture(device=self.device):
@@ -3237,30 +3128,10 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
 
                 compilation_cases = list(reversed(self.tpugraph_batch_sizes))
 
-                try:
-                    self._capture_tpugraphs(
-                        compilation_cases,
-                        tpugraph_runtime_mode=tpugraph_runtime_mode,
-                        uniform_decode=False)
-                except Exception as e:
-                    error_msg = str(e)
-                    error_code = '0x7020023'
-                    pattern = r'retCode=([^,\s\.]+)'
-                    match = re.search(pattern, error_msg)
-                    if match:
-                        retCode = match.group(1)
-                    # Determine whether the error message is caused by stream capture failure.
-                    if match and retCode == error_code:
-                        logger.error(
-                            f"ACLgraph sizes capture fail: {type(e).__name__}:\n"
-                            "ACLgraph has insufficient available streams to capture the configured number of sizes. "
-                            "Please verify both the availability of adequate streams and the appropriateness of the configured size count.\n\n"
-                            "Recommended solutions:\n"
-                            "1. Manually configure the compilation_config parameter "
-                            "with a reduced set of sizes: '{\"cudagraph_capture_sizes\":[size1, size2, size3, ...]}'.\n"
-                            "2. Utilize ACLgraph's full graph mode as an alternative to the piece-wise approach.\n\n"
-                            f"{str(e)}")
-                    raise
+                self._capture_tpugraphs(
+                    compilation_cases,
+                    tpugraph_runtime_mode=tpugraph_runtime_mode,
+                    uniform_decode=False)
 
             if tpugraph_mode.decode_mode() == CUDAGraphMode.FULL and \
                 tpugraph_mode.separate_routine():
@@ -3283,23 +3154,6 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         # we may doing lazy capturing in future that still allows capturing
         # after here.
         set_cudagraph_capturing_enabled(False)
-
-    def capture_model(self) -> None:
-
-        compilation_counter.num_gpu_runner_capture_triggers += 1
-
-        #start_time = time.perf_counter()
-        #start_free_npu_memory = torch.npu.mem_get_info()[0]
-
-        self._capture_model()
-
-        #end_time = time.perf_counter()
-        #end_free_npu_memory = torch.npu.mem_get_info()[0]
-        #elapsed_time = end_time - start_time
-        #npu_graph_size = start_free_npu_memory - end_free_npu_memory
-        # This usually takes 5~20 seconds.
-        #logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
-        #            elapsed_time, npu_graph_size / (1 << 30))
 
     def _get_prompt_logprobs_dict(
         self,
@@ -3392,7 +3246,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
 
         # Must synchronize the non-blocking NPU->CPU transfers.
         if prompt_logprobs_dict:
-            torch.npu.synchronize()
+            torch.tpu.synchronize()
 
         return prompt_logprobs_dict
 
