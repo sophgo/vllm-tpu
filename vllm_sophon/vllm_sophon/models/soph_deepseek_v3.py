@@ -409,6 +409,7 @@ class DeepseekV3Attention(torch.nn.Module):
                 input_lengths,
                 cache_lengths,
                 self.num_heads,
+		1,
                 self.q_lora_rank,
                 self.kv_lora_rank,
                 self.qk_nope_head_dim,
