@@ -38,7 +38,7 @@ RUN pip install torch==2.8.0 torchvision==0.23 --index-url https://download.pyto
 RUN git clone --branch v0.11.0 https://github.com/vllm-project/vllm.git \
  && cd vllm \
  && python3 use_existing_torch.py \
- && pip install -r requirements-build.txt \
+ && pip install -r ./requirements/build.txt \
  && VLLM_TARGET_DEVICE=empty pip install -e . --no-build-isolation
 
 COPY vllm_sophon /workspace/vllm_sophon
