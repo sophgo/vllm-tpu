@@ -38,7 +38,7 @@ def process_weights_after_loading(model: nn.Module, model_config: ModelConfig,
             module.process_weights_after_loading()
             continue
         quant_method = getattr(module, "quant_method", None)
-        if isinstance(quant_method, QuantizeMethodBase):
+        if isinstance(quant_method, QuantizeMethodBase) and not bool(getattr(getattr(quant_method, "quant_config", None), "is_checkpoint_fp8_serialized", False)):
             # When quant methods need to process weights after loading
             # (for repacking, quantizing, etc), they expect parameters
             # to be on the global target device. This scope is for the

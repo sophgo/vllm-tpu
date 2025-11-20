@@ -196,8 +196,6 @@ class SophColumnParallelLinear(ColumnParallelLinear):
         self.weight.data = soph_to_dtype(self.weight.data, self.params_dtype)
         if hasattr(self, 'weight_scale_inv') and self.weight_scale_inv is not None:
             self.weight_scale_inv.data = soph_to_dtype(self.weight_scale_inv.data, self.params_dtype)
-        if 'mlp' in name:
-            self.weight.data = self.weight.data.transpose(0,1).contiguous()
         if 'linear_1' in name:
             self.weight.data = self.weight.data.transpose(0,1).contiguous()
 

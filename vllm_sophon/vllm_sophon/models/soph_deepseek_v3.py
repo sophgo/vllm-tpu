@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple, Type
 import torch
 import torch.distributed
 from torch import nn
+from transformers import DeepseekV2Config, DeepseekV3Config
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 
@@ -66,6 +67,7 @@ from vllm_sophon.ops.soph_linear import (SophColumnParallelLinear,
                                                     SophReplicatedLinear,
                                                     SophRowParallelLinear,
                                                     soph_to_dtype)
+from vllm_sophon.attention.attention import SophAttentionState, SophTPUMetadata
 from vllm_sophon.ops.soph_embedding import SophEmbedding
 from vllm_sophon.ops.layernorm import SophonRMSNorm
 
@@ -115,111 +117,6 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     if scale <= 1:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
-
-class DeepseekV3Config(PretrainedConfig):
-    def __init__(
-        self,
-        vocab_size=102400,
-        hidden_size=4096,
-        intermediate_size=11008,
-        moe_intermediate_size=1407,
-        num_hidden_layers=30,
-        num_attention_heads=32,
-        num_key_value_heads=32,
-        n_shared_experts=2,
-        n_routed_experts=160,
-        ep_size=1,
-        routed_scaling_factor=1.0,
-        kv_lora_rank=512,
-        q_lora_rank=1536,
-        qk_rope_head_dim=64,
-        v_head_dim=128,
-        qk_nope_head_dim=128,
-        topk_method="gready",
-        n_group=8,
-        topk_group=3,
-        num_experts_per_tok=6,
-        moe_layer_freq=1,
-        first_k_dense_replace=0,
-        norm_topk_prob=False,
-        scoring_func="softmax",
-        aux_loss_alpha=0.001,
-        seq_aux=True,
-        hidden_act="silu",
-        max_position_embeddings=2048,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        pad_token_id=None,
-        bos_token_id=100000,
-        eos_token_id=100001,
-        pretraining_tp=1,
-        tie_word_embeddings=False,
-        rope_theta=10000.0,
-        rope_scaling=None,
-        attention_bias=False,
-        attention_dropout=0.0,
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.moe_intermediate_size = moe_intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.n_shared_experts = n_shared_experts
-        self.n_routed_experts = n_routed_experts
-        self.ep_size = ep_size
-        self.routed_scaling_factor = routed_scaling_factor
-        self.kv_lora_rank = kv_lora_rank
-        self.q_lora_rank = q_lora_rank
-        self.qk_rope_head_dim = qk_rope_head_dim
-        self.v_head_dim = v_head_dim
-        self.qk_nope_head_dim = qk_nope_head_dim
-        self.topk_method = topk_method
-        self.n_group = n_group
-        self.topk_group = topk_group
-        self.num_experts_per_tok = num_experts_per_tok
-        self.moe_layer_freq = moe_layer_freq
-        self.first_k_dense_replace = first_k_dense_replace
-        self.norm_topk_prob = norm_topk_prob
-        self.scoring_func = scoring_func
-        self.aux_loss_alpha = aux_loss_alpha
-        self.seq_aux = seq_aux
-        # for backward compatibility
-        if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
-
-        self.num_key_value_heads = num_key_value_heads
-        self.hidden_act = hidden_act
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.pretraining_tp = pretraining_tp
-        self.use_cache = use_cache
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self.attention_bias = attention_bias
-        self.attention_dropout = attention_dropout
-
-        tie_word_embeddings = kwargs.pop("tie_word_embeddings", False)
-        if tie_word_embeddings:
-            raise ValueError(
-                "tie_word_embeddings is not supported for Deepseek V2 models."
-            )
-
-        if ep_size != 1:
-            raise ValueError(
-                f"Currently only ep_size == 1 is supported for Deepseek V2 models, was {ep_size}"
-            )
-
-        super().__init__(
-            pad_token_id=pad_token_id,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
 
 class DeepseekV3Attention(torch.nn.Module):
     def __init__(
@@ -386,9 +283,8 @@ class DeepseekV3Attention(torch.nn.Module):
             slots = attn_metadata.slot_mapping
             input_lengths = attn_metadata.input_lengths
             cache_lengths = attn_metadata.cache_lengths
-            input_lengths = input_lengths + cache_lengths
             max_s = input_lengths.max().item()
-            kv_cache = self.kv_cache[forward_context.virtual_engine]
+            kv_cache = self.attn.kv_cache[forward_context.virtual_engine]
             torch.ops.my_ops.paged_latent_attention_fp8(
                 attention_output["attn_out"],
                 query,
@@ -698,7 +594,7 @@ class DeepseekV3DecoderLayer(nn.Module):
             default_dtype)
         if self.tp_size > 1:
             mlp_output = tensor_model_parallel_all_reduce(mlp_output)
-        return mlp_output, attn_res
+        return mlp_output, residual
 
 class SophTensorEmbedding(nn.Module):
     def __init__(self, prefix: str, weights):
@@ -827,17 +723,21 @@ class DeepseekV3Model(torch.nn.Module):
         cos, sin = self.rotary_emb(positions)
         cos = cos.contiguous().unsqueeze(1).repeat(1, 1, 2)
         sin = sin.contiguous().unsqueeze(1).repeat(1, 1, 2)
+        kvu = None
 
         # Attention metadata
         attn_metadata = get_forward_context().attn_metadata
-        # assume all layers have the same attn_state, use the first layer attn_metadata
-        attn_metadata = attn_metadata[self.start_layer.attn_metadata_prefix]
-        attn_state = attn_metadata.attn_state
-        cu_seqlen_prefill = attn_state not in [
-            SophAttentionState.DecodeOnly, SophAttentionState.SpecDecoding
-        ]
+        if attn_metadata is not None:
+            # assume all layers have the same attn_state, use the first layer attn_metadata
+            attn_metadata = attn_metadata[self.layers[self.start_layer].self_attn.attn_metadata_prefix]
+            attn_state = attn_metadata.attn_state
+            cu_seqlen_prefill = attn_state not in [
+                SophAttentionState.DecodeOnly, SophAttentionState.SpecDecoding
+            ]
+            max_s = attn_metadata.input_lengths.max().item()
+        else:
+            cu_seqlen_prefill = False
 
-        kvu = None
         if cu_seqlen_prefill:
             kvu = torch.empty((max_s, self.num_heads, self.qk_nope_head_dim + self.value_head_size), dtype = default_dtype, device = default_device)
 
@@ -903,10 +803,9 @@ class DeepseekV3ForCausalLM(nn.Module, SupportsPP):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
+        self.logits_processor.use_all_gather = True
+        logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
     def sample(
