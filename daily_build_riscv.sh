@@ -23,7 +23,7 @@ done
 echo PIP_INDEX_URL: ${PIP_INDEX_URL}
 
 IMAGE_NAME="soph_vllm_riscv"
-IMAGE_TAG="0.7.3"
+IMAGE_TAG="0.11.0"
 DOCKERFILE="Dockerfile.sophtpu_riscv"
 DOCKERFILE_SHA256=$(sha256sum ${DOCKERFILE} | cut -c 1-8)
 
