@@ -150,7 +150,7 @@ class SophRowParallelLinear(RowParallelLinear):
             self.weight.data = self.weight.data.transpose(0,1).contiguous()
             if hasattr(self, 'weight_scale_inv') and self.weight_scale_inv is not None:
                 self.weight_scale_inv.data = self.weight_scale_inv.data.transpose(0,1).contiguous()
-        if 'linear_1' in name:
+        if 'multi_modal_projector.linear_2' in name:
             self.weight.data = self.weight.data.transpose(0,1).contiguous()
 
 class SophColumnParallelLinear(ColumnParallelLinear):
@@ -196,7 +196,9 @@ class SophColumnParallelLinear(ColumnParallelLinear):
         self.weight.data = soph_to_dtype(self.weight.data, self.params_dtype)
         if hasattr(self, 'weight_scale_inv') and self.weight_scale_inv is not None:
             self.weight_scale_inv.data = soph_to_dtype(self.weight_scale_inv.data, self.params_dtype)
-        if 'linear_1' in name:
+        if 'vision_tower.vision_model' in name and 'mlp' in name:
+            self.weight.data = self.weight.data.transpose(0,1).contiguous()
+        if 'multi_modal_projector.linear_1' in name:
             self.weight.data = self.weight.data.transpose(0,1).contiguous()
 
 class SophReplicatedLinear(ReplicatedLinear):
