@@ -25,6 +25,7 @@ RUN apt-get update && \
         vim \
         pandoc \
         wget \
+        gnupg \
         numactl \
         gcc-12 \
         g++-12 \
@@ -54,25 +55,8 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# # 创建目标目录并下载密钥
-# RUN mkdir -p /etc/apt/keyrings && \
-#     wget -O /etc/apt/keyrings/llvm-snapshot.gpg https://apt.llvm.org/llvm-snapshot.gpg.key
-
-# # 添加软件源（使用 signed-by 指定密钥路径）
-# RUN echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/focal/ llvm-toolchain-focal main" >> /etc/apt/sources.list.d/llvm.list
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget \
-    gnupg \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN wget -q -O /tmp/llvm-snapshot.gpg.key https://apt.llvm.org/llvm-snapshot.gpg.key \
-    && gpg --dearmor < /tmp/llvm-snapshot.gpg.key > /usr/share/keyrings/llvm-snapshot-archive-keyring.gpg \
-    && rm /tmp/llvm-snapshot.gpg.key
-
 # 安装所有必要的系统依赖
 RUN apt-get update && apt-get install -y \
-    libsentencepiece-dev \
     libprotobuf-dev \
     protobuf-compiler \
     libprotoc-dev \
@@ -106,10 +90,9 @@ ENV LD_LIBRARY_PATH=/workspace/.venv/lib/python3.12/site-packages/torch/lib
 
 
 # install Python dependencies
-RUN echo "sentencepiece==0.2.0" > constraints.txt
 COPY requirements-common.txt requirements-common.txt
 COPY requirements-sophtpu.txt requirements-sophtpu.txt
-RUN uv pip install --no-cache -c constraints.txt -r requirements-sophtpu.txt && \
+RUN uv pip install --no-cache -r requirements-sophtpu.txt && \
     uv pip install --no-cache setuptools_scm aiohttp uvloop fastapi uvicorn partial_json_parser \
                               python-multipart pytest setuptools_rust maturin scikit-build meson \
                               cython pythran pybind11 scikit-build-core nanobind && \
