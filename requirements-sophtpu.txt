@@ -51,3 +51,4 @@ jinja2
 # Required for N-gram speculative decoding
 numba
 
+pandas
