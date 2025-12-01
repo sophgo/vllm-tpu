@@ -55,6 +55,7 @@ from vllm.model_executor.models.utils import (extract_layer_index,
                                               is_pp_missing_parameter,
                                               make_empty_intermediate_tensors_factory, make_layers,
                                               maybe_prefix)
+from vllm_sophon.attention.attention import SophAttentionState, SophTPUMetadata
 from vllm_sophon.ops.layernorm import SophonRMSNorm
 from vllm_sophon.ops.soph_embedding import SophEmbedding
 from vllm_sophon.ops.soph_fused_moe import SophDeepseekV3FusedMoE
@@ -560,7 +561,7 @@ class Qwen3MoeModel(nn.Module):
                 "hidden_states": hidden_states,
                 "residual": residual
             })
-        soph_rmsnorm(self.norm.weight, rms_buffer, hidden_states, self.eps, residual)
+        hidden_states, residual = self.norm(hidden_states, rms_buffer, residual)
         return rms_buffer
 
 class Qwen3MoeForCausalLM(nn.Module, SupportsPP, SupportsLoRA):

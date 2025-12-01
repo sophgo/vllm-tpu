@@ -715,7 +715,6 @@ if __name__ == "__main__":
         args.batch, args.input_length, args.max_new_tokens, mode
     )
 
-    """
     if args.save_json:
         abs_dir = os.path.dirname(os.path.abspath(args.save_json))
         os.makedirs(abs_dir, exist_ok=True)
@@ -741,4 +740,3 @@ if __name__ == "__main__":
         logger.info(f"Results saved to {output_file}")
     if args.save_results:
         result.save_csv(f"results_{args.tp_size}.csv")
-    """

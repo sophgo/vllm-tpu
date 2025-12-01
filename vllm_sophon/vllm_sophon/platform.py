@@ -18,6 +18,7 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch_tpu
 import json
 import os
 from pathlib import Path
@@ -41,7 +42,7 @@ logger = init_logger(__name__)
 class SophTpuPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "sophtpu"
-    device_type: str = "sophtpu"
+    device_type: str = "tpu:0"
     simple_compile_backend: str = "eager"  # Disable torch.compile()
     dispatch_key: str = "PrivateUse1"
     ray_device_key: str = ""

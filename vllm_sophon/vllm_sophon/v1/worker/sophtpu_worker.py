@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.worker.utils import bind_kv_cache
 from vllm.distributed.parallel_state import _WORLD, init_world_group
+from vllm.tasks import SupportedTask
 from vllm_sophon.platform import get_soph_config_manager
 from vllm_sophon.v1.worker.sophtpu_model_runner import SophTPUModelRunner
 from vllm_sophon.attention.attention import SophTPUAttentionBackend
@@ -188,6 +189,9 @@ class SophTPUWorker(WorkerBase):
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
+    
+    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        return self.model_runner.get_supported_tasks()
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return self.model_runner.get_kv_cache_spec()
