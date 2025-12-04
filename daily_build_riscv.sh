@@ -27,19 +27,26 @@ IMAGE_TAG="0.11.0"
 DOCKERFILE="Dockerfile.sophtpu_riscv"
 DOCKERFILE_SHA256=$(sha256sum ${DOCKERFILE} | cut -c 1-8)
 
+IMAGE_TAG_PREFIX=${IMAGE_TAG}
+remote_branch=$(git branch -vv | grep '^\*' | awk '{print $4}' | cut -d'[' -f2 | cut -d']' -f1)
+if [[ "$remote_branch" == "origin/master" ]]; then
+    echo "当前跟踪的远程分支是 master"
+    IMAGE_TAG_PREFIX=${IMAGE_TAG}-$(date +%Y%m%d)
+fi
+
 COMMIT_ID=$(git rev-parse --short HEAD)
 TORCH_TPU_COMMIT_ID=$(ls third-party/torch-tpu* | awk -F'[_.]' '{print $(NF-2)}')
 
 # clean docker image
-if [ -n "$(docker images -q ${IMAGE_NAME}:${IMAGE_TAG} 2> /dev/null)" ]; then
-    docker image rm ${IMAGE_NAME}:${IMAGE_TAG}
+if [ -n "$(docker images -q ${IMAGE_NAME}:${IMAGE_TAG}* 2> /dev/null)" ]; then
+    docker image rm ${IMAGE_NAME}:${IMAGE_TAG}*
 fi
 
 # build & export docker image
-docker build --build-arg PIP_INDEX_URL=${PIP_INDEX_URL} -f ${DOCKERFILE} -t ${IMAGE_NAME}:${IMAGE_TAG} .
-docker save ${IMAGE_NAME}:${IMAGE_TAG} | bzip2 > docker-${IMAGE_NAME}-${IMAGE_TAG}-${DOCKERFILE_SHA256}-${COMMIT_ID}-${TORCH_TPU_COMMIT_ID}.tar.bz2
+docker build --build-arg PIP_INDEX_URL=${PIP_INDEX_URL} -f ${DOCKERFILE} -t ${IMAGE_NAME}:${IMAGE_TAG_PREFIX} .
+docker save ${IMAGE_NAME}:${IMAGE_TAG_PREFIX} | bzip2 > docker-${IMAGE_NAME}-${IMAGE_TAG}-${DOCKERFILE_SHA256}-${COMMIT_ID}-${TORCH_TPU_COMMIT_ID}.tar.bz2
 
 # clean docker iamge
-if docker images -q ${IMAGE_NAME}:${IMAGE_TAG}; then
-    docker image rm -f ${IMAGE_NAME}:${IMAGE_TAG}
+if docker images -q ${IMAGE_NAME}:${IMAGE_TAG_PREFIX}; then
+    docker image rm -f ${IMAGE_NAME}:${IMAGE_TAG_PREFIX}
 fi

@@ -49,6 +49,7 @@ RUN apt-get update && \
         liblcms2-dev \
         libwebp-dev \
         gfortran \
+        libpng-dev \
         libopenblas-dev \
         liblapack-dev \
         libatlas-base-dev \
@@ -73,9 +74,7 @@ RUN uv venv -p python${PYTHON_VERSION} /workspace/.venv && \
 COPY third-party third-party
 COPY third-party/ld-linux-riscv* /lib/
 RUN cd third-party && \
-    tar -xzvf torch-tpu*.tar.gz && \
-    uv pip install ./torch-*_riscv64.whl ./dist/torch_tpu*_riscv64.whl && \
-    rm -rf third-party
+    uv pip install ./torch-*_riscv64.whl
 ENV LD_LIBRARY_PATH=/workspace/.venv/lib/python3.12/site-packages/torch/lib
 
 # 安装 Python 依赖
@@ -93,6 +92,17 @@ RUN git clone --depth 1 https://github.com/mesonbuild/meson-python.git /tmp/meso
     uv pip install . && \
     rm -rf /tmp/meson-python
 
+RUN git clone --branch v0.23.0 --depth 1 https://github.com/pytorch/vision.git /tmp/vision && \
+    cd /tmp/vision && \
+    # 设置环境变量
+    export FORCE_CUDA=0 && \
+    export BUILD_VERSION=0.23.0 && \
+    # 关键：设置 PYTHONPATH 让构建系统找到 torch
+    export PYTHONPATH=/workspace/.venv/lib/python3.12/site-packages:$PYTHONPATH && \
+    # 使用 setup.py 直接安装（绕过 pyproject.toml）
+    python setup.py install && \
+    cd / && rm -rf /tmp/vision
+
 # 安装 vllm（保持源码在 /workspace/vllm）
 RUN git clone --branch v0.11.0 --depth 1 https://github.com/vllm-project/vllm.git /workspace/vllm
 WORKDIR /workspace/vllm
@@ -102,6 +112,10 @@ RUN python3 use_existing_torch.py && \
 
 # 安装 vllm_sophon（保持源码在 /workspace/vllm_sophon）
 WORKDIR /workspace
+RUN cd third-party && \
+    tar -xzvf torch-tpu*.tar.gz && \
+    uv pip install ./dist/torch_tpu*_riscv64.whl && \
+    rm -rf third-party
 COPY vllm_sophon /workspace/vllm_sophon
 WORKDIR /workspace/vllm_sophon
 RUN uv pip install -e . --no-build-isolation
@@ -159,7 +173,8 @@ ENV LD_LIBRARY_PATH=/workspace/.venv/lib/python3.12/site-packages/torch/lib
 # 验证安装
 WORKDIR /workspace
 RUN python -c "import vllm; print('vLLM imported successfully')" && \
-    python -c "import vllm_sophon; print('vLLM Sophon imported successfully')"
+    python -c "import vllm_sophon; print('vLLM Sophon imported successfully')" && \
+    python -c "import torch; import torchvision; print(f'PyTorch: {torch.__version__}'); print(f'torchvision: {torchvision.__version__}')"
 
 # 设置默认工作目录
 WORKDIR /workspace

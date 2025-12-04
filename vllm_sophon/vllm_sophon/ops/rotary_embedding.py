@@ -74,7 +74,7 @@ def rope_qwen2_5_vl_forward_oot(
     assert positions.ndim == 1 or positions.ndim == 2
 
     num_tokens = positions.shape[-1]
-    cos_sin = self.cos_sin_cache[positions]
+    cos_sin = self.cos_sin_cache[positions.contiguous()]
     cos, sin = cos_sin.chunk(2, dim=-1)
     if positions.ndim == 2:
         assert self.mrope_section
