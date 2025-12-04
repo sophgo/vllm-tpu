@@ -270,7 +270,7 @@ class CaseResult:
                     "text_generated": self.inference_data.text_generated,
                     "real_input_len": self.inference_data.real_input_len,
                     "real_output_len": self.inference_data.real_output_len,
-                    "TP": WORLD_SIZE,
+                    "TP": self.benchmark.world_size,
                     "FTL_ms": self.performance.FTL_ms,
                     "TPS": self.performance.TPS,
                     "quality": self.quality.score,
@@ -675,7 +675,7 @@ class TestModelRunner:
                 input_length=input_length,
                 max_new_tokens=max_new_tokens,
                 mode=mode.name,
-                world_size=WORLD_SIZE,
+                world_size=self.tp,
             ),
             performance=CaseResult.Performance(
                 FTL_ms=FTL_ms,
