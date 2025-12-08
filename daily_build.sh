@@ -47,7 +47,7 @@ docker build --build-arg PIP_INDEX_URL=${PIP_INDEX_URL} -f ${DOCKERFILE} -t ${IM
 docker save ${IMAGE_NAME}:${IMAGE_TAG_PREFIX} | bzip2 > docker-${IMAGE_NAME}-${IMAGE_TAG}-${DOCKERFILE_SHA256}-${COMMIT_ID}-${TORCH_TPU_COMMIT_ID}.tar.bz2
 
 # Build docs
-DOCKER_IMG_PANDOC=${IMAGE_NAME}:${IMAGE_TAG}
+DOCKER_IMG_PANDOC=${IMAGE_NAME}:${IMAGE_TAG_PREFIX}
 DOCKER_IMG_DOCUMENT=sophgo/torch_tpu:latest
 
 docker run --entrypoint bash --rm -v $(pwd):/workspace/ $DOCKER_IMG_PANDOC -c 'cd /workspace && pandoc --from=markdown --to=rst --output=sophgo_docs/source_zh/readme.rst README_sophtpu.md'
