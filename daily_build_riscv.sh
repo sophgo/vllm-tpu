@@ -29,7 +29,8 @@ DOCKERFILE_SHA256=$(sha256sum ${DOCKERFILE} | cut -c 1-8)
 
 IMAGE_TAG_PREFIX=${IMAGE_TAG}
 remote_branch=$(git branch -vv | grep '^\*' | awk '{print $4}' | cut -d'[' -f2 | cut -d']' -f1)
-if [[ "$remote_branch" == "origin/master" ]]; then
+if [[ "$remote_branch" == "origin/master" || \
+   ( -n "$FTP_RELEASE_DIR" && "$FTP_RELEASE_DIR" == *daily_build* ) ]]; then
     echo "当前跟踪的远程分支是 master"
     IMAGE_TAG_PREFIX=${IMAGE_TAG}-$(date +%Y%m%d)
 fi
