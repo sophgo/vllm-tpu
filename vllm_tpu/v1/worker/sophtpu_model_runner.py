@@ -133,12 +133,12 @@ class GraphCaptureContext:
 def graph_capture(device: torch.device):
     """
     `graph_capture` is a context manager which should surround the code that
-    is capturing the NPU graph. Its main purpose is to ensure that the
+    is capturing the TPU graph. Its main purpose is to ensure that the
     some operations will be run after the graph is captured, before the graph
     is replayed. It returns a `GraphCaptureContext` object which contains the
     necessary data for the graph capture. Currently, it only contains the
     stream that the graph capture is running on. This stream is set to the
-    current NPU stream when the context manager is entered and reset to the
+    current TPU stream when the context manager is entered and reset to the
     default stream when the context manager is exited. This is to ensure that
     the graph capture is running on a separate stream from the default stream,
     in order to explicitly distinguish the kernels to capture
@@ -1024,7 +1024,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
 
         Carefully handles the `prev_sampled_token_ids` which can be cached
         from the previous engine iteration, in which case those tokens on the
-        NPU need to be copied into the corresponding slots into input_ids."""
+        TPU need to be copied into the corresponding slots into input_ids."""
 
         if self.input_batch.prev_sampled_token_ids is None:
             # Normal scheduling case
@@ -1035,7 +1035,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
 
         # Async scheduling case, where some decode requests from the previous
         # iteration won't have entries in input_ids_cpu and need to be copied
-        # on the NPU from prev_sampled_token_ids.
+        # on the TPU from prev_sampled_token_ids.
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
         assert prev_req_id_to_index is not None
         flattened_indices = []
@@ -1054,7 +1054,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         num_commmon_tokens = len(flattened_indices)
         if num_commmon_tokens < total_num_scheduled_tokens:
             # If not all requests are decodes from the last iteration,
-            # We need to copy the input_ids_cpu to the NPU first.
+            # We need to copy the input_ids_cpu to the TPU first.
             self.input_ids[:total_num_scheduled_tokens].copy_(
                 self.input_ids_cpu[:total_num_scheduled_tokens],
                 non_blocking=True)
@@ -1255,7 +1255,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         self.positions[:num_input_tokens].copy_(
             self.positions_cpu[:num_input_tokens], non_blocking=True)
 
-        # Copy the tensors to the NPU.
+        # Copy the tensors to the TPU.
         self._prepare_input_ids(total_num_scheduled_tokens, cu_num_tokens)
 
         # _prepare_inputs may reorder the batch, so we must gather
@@ -1472,7 +1472,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
 
-        # TODO: Optimize the CPU -> NPU copy.
+        # TODO: Optimize the CPU -> TPU copy.
         cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
             self.device, non_blocking=True)
         logits_indices = torch.from_numpy(logits_indices).to(self.device,
@@ -1802,7 +1802,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         req_id_to_index_output_copy = \
             self.input_batch.req_id_to_index.copy()
 
-        # NOTE: NPU -> CPU Sync happens here.
+        # NOTE: TPU -> CPU Sync happens here.
         # Move as many CPU operations as possible before this sync point.
         logprobs_tensors = sampler_output.logprobs_tensors
         logprobs_lists = logprobs_tensors.tolists() \
@@ -1837,7 +1837,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
             invalid_req_indices_set = set(invalid_req_indices)
             assert sampled_token_ids.shape[-1] == 1
 
-            # Cache the sampled tokens on the NPU and avoid CPU sync.
+            # Cache the sampled tokens on the TPU and avoid CPU sync.
             # These will be copied into input_ids in the next step
             # when preparing inputs.
             self.input_batch.prev_sampled_token_ids = \
@@ -2176,7 +2176,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
                 self.max_num_tokens //
                 self.pcp_size if self.pcp_size > 1 else self.max_num_tokens,
                 with_prefill=True)
-            # MC2 will consume additional NPU memory.
+            # MC2 will consume additional TPU memory.
             # Therefore, we need to run the MC2 path once here to complete its initialization,
             # allowing vLLM to correctly estimate the maximum memory required.
 
@@ -2343,7 +2343,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             assert len(kv_cache_tensor.shared_by) == 1, (
                 "KV cache tensor shared by multiple layers is not supported in "
-                "NPU.")
+                "TPU.")
             kv_cache_sizes[kv_cache_tensor.shared_by[0]] = kv_cache_tensor.size
 
         kv_caches: Dict[str, torch.Tensor] = {}
@@ -3229,7 +3229,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
             token_ids, logprobs, ranks = self.sampler.gather_logprobs(
                 logprobs, num_prompt_logprobs, tgt_token_ids)
 
-            # Transfer NPU->CPU async.
+            # Transfer TPU->CPU async.
             chunk_slice = slice(start_idx, start_idx + num_logits)
             logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
                 token_ids, non_blocking=True)
@@ -3244,7 +3244,7 @@ class SophTPUModelRunner(LoRAModelRunnerMixin):
             del num_prompt_logprobs_dict[req_id]
             del in_progress_dict[req_id]
 
-        # Must synchronize the non-blocking NPU->CPU transfers.
+        # Must synchronize the non-blocking TPU->CPU transfers.
         if prompt_logprobs_dict:
             torch.tpu.synchronize()
 
