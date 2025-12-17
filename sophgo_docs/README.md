@@ -4,11 +4,11 @@ This is the document of vLLM-TPU.
 
 ## Prerequisites
 
-python3.8 is prefered
+python3.12 is prefered
 
 ```shell
 sudo apt install texlive-xetex texlive-latex-recommended
-pip3.8 install sphinx sphinx-autobuild sphinx_rtd_theme rst2pdf
+pip3.12 install sphinx sphinx-autobuild sphinx_rtd_theme rst2pdf
 ```
 
 ## Get Fandol font for linux system

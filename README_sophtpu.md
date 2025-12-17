@@ -1,6 +1,6 @@
 ## 项目介绍
 
-本项目基于 [vLLM v7.3.0](https://github.com/vllm-project/vllm/releases/tag/v0.7.3)，支持在 Sophon TPU SG2260 上运行 LLaMa, Qwen, DeepSeek 等主流大语言模型。
+本项目基于 [vLLM v0.11.0](https://github.com/vllm-project/vllm/releases/tag/v0.11.0)，支持在 Sophon TPU SG2260 上运行 LLaMa, Qwen, DeepSeek 等主流大语言模型。
 
 ### Release 地址
 
@@ -53,7 +53,7 @@ bunzip2 -c docker-soph_vllm-<TAG>.tar.bz2 | docker load
 （可选）如有需要可以手动编译docker镜像
 
 ```shell
-docker build -t soph_vllm:0.7.3 -f Dockerfile.sophtpu .
+docker build -t soph_vllm:0.11.0 -f Dockerfile.sophtpu .
 ```
 
 ### 驱动及Runtime环境
@@ -91,7 +91,7 @@ docker run --privileged -td --restart always \
   -p 8080:80 \
   -v <DATA_PATH>:/data \
   -v /opt/tpuv7:/opt/tpuv7 \
-  soph_vllm:0.7.3
+  soph_vllm:0.11.0
 ```
 
 说明：
@@ -108,7 +108,7 @@ docker run --privileged -td --restart always \
   -v /dev/:/dev/ \
   -v <DATA_PATH>:/data \
   -v /opt/tpuv7:/opt/tpuv7 \
-  soph_vllm:0.7.3
+  soph_vllm:0.11.0
 ```
 
 说明：
@@ -122,6 +122,7 @@ docker exec -it <CONTAINER_NAME> bash
 
 #### 安装Torch-TPU whl包
 
+Docker镜像中已预装Torch-TPU Whl包，如想安装指定版本的Whl包，可参考以下方式：
 从FTP服务器上`torch_tpu/release_build/latest_release`目录下拉取torch-tpu whl包并安装：
 
 ```shell
@@ -129,24 +130,7 @@ tar -xvf torch-tpu_*.tar.gz
 pip install dist/torch_tpu-*_x86_64.whl --force-reinstall
 ```
 
-#### 映射 `vllm` 代码（可选，如果使用本地代码则需要映射）
-1. 使用非插件化功能
-```shell
-export PYTHONPATH=path_to_vLLM
-```
-2. 使用插件化功能
-```shell
-export PYTHONPATH=path_to_vllm:path_to_vllm_sophon
-```
-**注意**：
- - 由于 `vLLM` 同样存在 `vllm`目录，因此使用插件化功能时需要优先设置官网 `vllm` 路径，否则会加载 `vLLM/vllm` 目录。即不能设置 `export PYTHONPATH=path_to_vllm_sophon:path_to_vllm`。
- - 当前仅支持 `vllm v0.7.3` 版本，需要切换到该分支。
- - 使用 `docker` 环境中的 `PyTorch` 环境: `python3 use_existing_torch.py`。
- - `vllm` 需要 `torch-2.5.1` 及以上版本，由于当前 `torch-tpu` 仅支持 `torch-2.1.0`，对于插件化功能需要临时以下部分代码:
-   - 注释 `vllm/__init__.py` 37行代码 `torch._inductor.config.compile_threads = 1`
-   - 修改 `vllm/_custom_ops.py` 28行代码 `if TYPE_CHECKING:` 为 `if True:`，注册 `register_fake` 函数。
- - 上述事项只针对插件化功能，源码修改都是在官方 `vllm/vllm` 代码，而不是 `vLLM/vllm` 代码。
-
+##服务测试
 
 ### 设置环境变量
 
@@ -238,7 +222,7 @@ bash emulate_4_users.sh
               -v <DATA_PATH>:/data \
               -v /opt/tpuv7:/opt/tpuv7 \
               --entrypoint /bin/bash \
-              soph_vllm:0.7.3
+              soph_vllm:0.11.0
     ```
 
 2. 进入docker容器，初始化环境：
@@ -249,7 +233,7 @@ bash emulate_4_users.sh
 
 3. 安装Torch-TPU whl包
 
-    从FTP服务器上`torch_tpu/release_build/latest_release`目录下拉取torch-tpu whl包并安装：
+    Docker中已预装，如需要安装指定版本whl包，从FTP服务器上`torch_tpu/release_build/latest_release`目录下拉取torch-tpu whl包并安装：
 
     ```shell
     tar -xvf torch-tpu_*.tar.gz

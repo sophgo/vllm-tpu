@@ -78,7 +78,7 @@ RUN cd third-party && \
 ENV LD_LIBRARY_PATH=/workspace/.venv/lib/python3.12/site-packages/torch/lib
 
 # 安装 Python 依赖
-COPY requirements-common.txt requirements-sophtpu.txt ./
+COPY requirements-sophtpu.txt ./
 RUN uv pip install -r requirements-sophtpu.txt && \
     uv pip install \
         setuptools_scm aiohttp uvloop fastapi uvicorn partial_json_parser \
